@@ -189,7 +189,17 @@ Rules:
 - Distribution kinds: `categorical{categories, probs}`, `normal{mean, std}`,
   `lognormal{mu, sigma}`, `uniform{low, high}`, `exponential{rate}`,
   `gamma{shape, scale}`, `beta{a, b}`, `uniform_int{low, high}` (inclusive),
-  `datetime_uniform{start, end}` (ISO-8601, no tz; second resolution).
+  `datetime_uniform{start, end}` (ISO-8601, no tz; second resolution),
+  `zipf{a, n}` (0-based ranks `0..n-1` via `scipy.stats.zipfian.ppf(u, a, n) - 1`;
+  long-tail popularity).
+- Optional column field `reference: {table}` — a **dimension reference**
+  (star-schema FK across the tree): the column samples row keys of the referenced
+  table via its `distribution` and the engine clips values to `[0, rows-1]`.
+  Requires: column type `int64` with an integer-valued `distribution`
+  (`zipf` or `uniform_int`); the referenced table is a `root` table (its keys are
+  the contiguous range `0..rows-1`, so FK validity holds by construction).
+  Rank 0 is the most popular referenced row under `zipf` — referenced entities
+  are identified with their popularity rank.
 - `copulas[].correlation` must be symmetric with unit diagonal; columns listed must
   have a `distribution` in the same table.
 - `temporal.anchor` is either `"{col}"` (same table) or `"{parent_table}.{col}"`.
@@ -268,8 +278,9 @@ class Engine:
 
 Backbone validation (`ParquetBackbone.validate(metadata) -> list[str]`) runs DuckDB
 SQL over the written dataset: PK uniqueness, FK integrity (every child FK exists in
-parent), root row counts match metadata, temporal ordering (event ≥ its anchor,
-nulls exempt). Returns human-readable violation strings (empty list = OK).
+parent), reference integrity (every `reference:` column value exists in the
+referenced table's PK), root row counts match metadata, temporal ordering (event ≥
+its anchor, nulls exempt). Returns human-readable violation strings (empty list = OK).
 
 ## 7. Fitting & privacy
 
@@ -288,6 +299,12 @@ new `Metadata` with fitted parameters:
 - columns with any `generator` (including `parent:{column}` inherited columns)
   are never fitted — the master table's fitted distribution is the single
   source of truth for inherited attributes.
+- `reference:` columns → `zipf{a, n}`: `n` = the referenced table's `rows` from
+  the skeleton; `a` fitted by maximum likelihood over the deterministic grid
+  `a ∈ {1.05, 1.10, …, 3.50}` against the observed rank-frequency profile of the
+  column's value counts (identity of referenced values is discarded — only the
+  popularity profile is released). Zipf parameters are released without DP noise
+  (documented v0 limitation, like datetime ranges).
 - copula correlation: Spearman ρ per pair → Pearson on latents via `2·sin(πρ/6)`.
 - temporal delays: observed `event − anchor` seconds (nonneg); if ≥ 95% of the
   observed delays are > 0 → **robust lognormal** fitted on the strictly-positive
@@ -326,6 +343,13 @@ and a shop database) as one entity tree. The pattern:
   of partitions and workers.
 - `source:` only routes output into per-source directories; validation joins
   across sources exactly as within one.
+- A second cross-source mechanism is the **dimension reference** (`reference:`,
+  §2): a master source can own a dimension root (e.g. a product catalog in an
+  inventory system) that fact tables in other sources point into via a fitted
+  popularity distribution — and a downstream system can react to another
+  source's facts by being their child (e.g. shipment orders as children of shop
+  orders: the order is leading, the shipment references it via `parent_key`,
+  and a temporal anchor + strictly-positive delay keeps it always later).
 
 ## 9. CLI
 
