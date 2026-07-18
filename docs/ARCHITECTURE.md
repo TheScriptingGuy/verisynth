@@ -175,9 +175,16 @@ tables:
 Rules:
 
 - `role`: `root` (has `rows`) or `child` (has `parent`, `cardinality`, `child_stride`).
+- Optional `source: <name>` on any table names the source system it belongs to
+  (e.g. `crm`, `shop`). It affects only the output layout (§6) — generation
+  semantics are unchanged, which is what guarantees cross-source consistency.
 - Column `type` ∈ `{int64, float64, string, bool, timestamp}`.
-- Column value source is exactly one of: `generator` (`key` | `parent_key`),
-  `distribution`, or `temporal`.
+- Column value source is exactly one of: `generator`, `distribution`, or `temporal`.
+- `generator` ∈ `key` | `parent_key` | `parent:{column}`. The `parent:{column}`
+  form (child tables only) **inherits** the parent row's value for that column —
+  master-data propagation: the value is copied (with its null mask), never
+  re-generated, so it is identical wherever it appears downstream. The referenced
+  parent column must exist, must not be derived, and must have the same type.
 - Optional per-column: `clamp: [lo, hi]`, `round: true`, `null_rate: p`.
 - Distribution kinds: `categorical{categories, probs}`, `normal{mean, std}`,
   `lognormal{mu, sigma}`, `uniform{low, high}`, `exponential{rate}`,
@@ -198,7 +205,10 @@ Rules:
 - Child count per parent: sampled from `cardinality` via
   `u = keyed_uniforms(seed, "{child}.__cardinality__", [parent_key])`, inverse-CDF of
   the distribution, clamped to `[0, max]` and `max < child_stride` (validated).
-  Kinds: `poisson{lam, max}`, `uniform_int{low, high, max}`, `fixed{n}`.
+  Kinds: `poisson{lam, max}`, `uniform_int{low, high, max}`, `fixed{n}`,
+  `bernoulli{p}` (0-or-1 children, `count = (u > 1 - p)`; effective max is 1 —
+  the natural kind for optional one-to-one relationships such as "CRM contact
+  has a shop account").
 - Child row_key = `parent_row_key * child_stride + j` for `j in 0..count-1`.
   Guarantees global uniqueness and determinism without coordination.
   (`generator: key` → own row_key; `generator: parent_key` → parent's row_key.)
@@ -239,10 +249,13 @@ If the anchor value is null, the result is null. Cycles → `MetadataError`.
 2. Roots: row_keys from partition range. Children: expand from parent row_keys via
    cardinality (repeat parent keys per count; compute child row_keys).
 3. Generate columns in stages: (a) plain distribution + copula-driven marginals,
-   (b) temporal (topological), (c) null masks applied (`null_rate`), (d) clamp/round,
-   (e) cast to Arrow schema, (f) Polars derived columns.
+   (b) generator columns (`key`, `parent_key`, and `parent:{column}` inheritance
+   via the parent-position index), (c) temporal (topological), (d) null masks
+   applied (`null_rate`), (e) clamp/round, (f) cast to Arrow schema,
+   (g) Polars derived columns.
 4. Emit `dict[str, pa.Table]`; backbone writes
-   `{out}/{table}/part-{p:05d}.parquet` via DuckDB `COPY`.
+   `{out}/{source}/{table}/part-{p:05d}.parquet` via DuckDB `COPY`
+   (`{out}/{table}/...` when the table has no `source`).
 
 Public API:
 
@@ -269,8 +282,12 @@ new `Metadata` with fitted parameters:
   else `normal` (mean/std).
 - string/bool → `categorical` from value counts.
 - timestamp → `datetime_uniform` from min/max.
-- child cardinality → `poisson` with `lam = mean count per parent`,
+- child cardinality → if every observed count is 0 or 1 → `bernoulli{p = mean}`
+  (with `child_stride = 2`); else `poisson` with `lam = mean count per parent`,
   `max = ceil(observed max * 1.5)` (and `child_stride` = next power of two > max).
+- columns with any `generator` (including `parent:{column}` inherited columns)
+  are never fitted — the master table's fitted distribution is the single
+  source of truth for inherited attributes.
 - copula correlation: Spearman ρ per pair → Pearson on latents via `2·sin(πρ/6)`.
 - temporal delays: observed `event − anchor` seconds (nonneg); if ≥ 95% of the
   observed delays are > 0 → **robust lognormal** fitted on the strictly-positive
@@ -289,7 +306,28 @@ skeleton (range → sensitivity of mean = range/n). Category counts get
 Laplace(1/ε_i) noise, clamped ≥ 0, renormalized. DP noise uses its own
 `numpy.random.default_rng(dp_seed)` — it is *not* part of the keyed generation.
 
-## 8. CLI
+## 8. Multi-source datasets (master-source pattern)
+
+A single metadata document can describe several **source systems** (e.g. a CRM
+and a shop database) as one entity tree. The pattern:
+
+- The **master source** owns the root entity (e.g. `crm_contacts` with
+  `source: crm`); its columns are the authoritative fitted distributions.
+- A downstream system's entity table (e.g. `customers` with `source: shop`) is
+  a **child** of the master table — typically `cardinality: bernoulli{p}` for
+  "a fraction p of master records exist downstream" — and carries:
+  - its own `generator: key` primary key,
+  - a `generator: parent_key` reference to the master record,
+  - `generator: parent:{column}` **inherited columns** for every attribute the
+    master owns (state, segment, …).
+- Because generation is deterministic and inherited columns are copied rather
+  than re-sampled, the two sources agree row-for-row on shared attributes, and
+  cross-source referential integrity holds by construction — across any number
+  of partitions and workers.
+- `source:` only routes output into per-source directories; validation joins
+  across sources exactly as within one.
+
+## 9. CLI
 
 ```
 verisynth generate -m metadata.yaml -o out/ [--partitions K] [--seed S]
