@@ -618,3 +618,86 @@ def validate(md: Metadata) -> None:
                 raise MetadataError(f"{dpath}.name: required")
             if not der.expr:
                 raise MetadataError(f"{dpath}.expr: required")
+
+
+# --------------------------------------------------------------------------
+# Serialization (dataclasses -> plain yaml-safe dict) — exact inverse of
+# parse_metadata / _parse_* above. See docs/ARCHITECTURE.md §2.
+# --------------------------------------------------------------------------
+
+
+def _distribution_spec_to_dict(dist: DistributionSpec) -> dict[str, Any]:
+    d: dict[str, Any] = {"kind": dist.kind}
+    d.update(dist.params)
+    return d
+
+
+def _cardinality_spec_to_dict(card: CardinalitySpec) -> dict[str, Any]:
+    d: dict[str, Any] = {"kind": card.kind}
+    d.update(card.params)
+    return d
+
+
+def _temporal_spec_to_dict(temp: TemporalSpec) -> dict[str, Any]:
+    return {"anchor": temp.anchor, "delay": _distribution_spec_to_dict(temp.delay)}
+
+
+def _copula_spec_to_dict(cop: CopulaSpec) -> dict[str, Any]:
+    return {
+        "name": cop.name,
+        "columns": list(cop.columns),
+        "correlation": [list(row) for row in cop.correlation],
+    }
+
+
+def _derived_spec_to_dict(der: DerivedSpec) -> dict[str, Any]:
+    return {"name": der.name, "expr": der.expr}
+
+
+def _column_spec_to_dict(col: ColumnSpec) -> dict[str, Any]:
+    d: dict[str, Any] = {"type": col.type}
+    if col.generator is not None:
+        d["generator"] = col.generator
+    if col.distribution is not None:
+        d["distribution"] = _distribution_spec_to_dict(col.distribution)
+    if col.temporal is not None:
+        d["temporal"] = _temporal_spec_to_dict(col.temporal)
+    if col.clamp is not None:
+        d["clamp"] = [col.clamp[0], col.clamp[1]]
+    if col.round:
+        d["round"] = True
+    if col.null_rate:
+        d["null_rate"] = col.null_rate
+    return d
+
+
+def _table_spec_to_dict(t: TableSpec) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "role": t.role,
+        "primary_key": t.primary_key,
+        "columns": {cname: _column_spec_to_dict(c) for cname, c in t.columns.items()},
+    }
+    if t.role == "root":
+        d["rows"] = t.rows
+    else:
+        d["parent"] = t.parent
+        d["cardinality"] = _cardinality_spec_to_dict(t.cardinality)
+        d["child_stride"] = t.child_stride
+    if t.copulas:
+        d["copulas"] = [_copula_spec_to_dict(c) for c in t.copulas]
+    if t.derived:
+        d["derived"] = [_derived_spec_to_dict(d_) for d_ in t.derived]
+    return d
+
+
+def metadata_to_dict(md: Metadata) -> dict[str, Any]:
+    """Serialize ``Metadata`` back to a plain, yaml-safe nested dict.
+
+    Exact inverse of ``parse_metadata``: ``parse_metadata(metadata_to_dict(md))``
+    must succeed and re-serialize to an equal dict.
+    """
+    return {
+        "version": md.version,
+        "seed": md.seed,
+        "tables": {tname: _table_spec_to_dict(t) for tname, t in md.tables.items()},
+    }
