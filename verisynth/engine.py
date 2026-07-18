@@ -78,9 +78,16 @@ class Engine:
                     continue
                 if c.generator == "key":
                     values = row_keys.astype(np.int64)
-                else:  # parent_key
+                    mask = None
+                elif c.generator == "parent_key":
                     values = parent_row_keys[parent_pos].astype(np.int64)
-                columns[cname] = (values, None)
+                    mask = None
+                else:  # "parent:{column}" master-data inheritance
+                    parent_col_name = c.generator[len("parent:"):]
+                    pvalues, pmask = state[t.parent]["columns"][parent_col_name]
+                    values = pvalues[parent_pos]
+                    mask = pmask[parent_pos] if pmask is not None else None
+                columns[cname] = (values, mask)
 
             # --- Step 5: temporal columns --------------------------------------------
             temporal_names = {cname for cname, c in t.columns.items() if c.temporal is not None}
@@ -178,4 +185,4 @@ class Engine:
         for p in range(num_partitions):
             tables = self.generate_partition(p, num_partitions)
             for tname, tbl in tables.items():
-                backbone.write_partition(tname, tbl, p)
+                backbone.write_partition(tname, tbl, p, source=self.metadata.tables[tname].source)

@@ -423,3 +423,106 @@ def test_fit_temporal_delay_large_zero_fraction_selects_exponential():
     assert ordered_delay.kind == "exponential"
     expected_rate = 1.0 / max(float(np.mean(delay_s)), 1e-9)
     assert abs(ordered_delay.params["rate"] - expected_rate) / expected_rate < 0.05
+
+
+# --------------------------------------------------------------------------
+# 8. bernoulli cardinality fit rule (TASK CARD 11 §B / docs/ARCHITECTURE.md §7):
+#    if every observed per-parent count is 0 or 1 -> bernoulli{p = mean},
+#    child_stride = 2. A mixed-count frame still fits poisson (existing
+#    tests above already cover that).
+# --------------------------------------------------------------------------
+
+
+def _generate_bernoulli_frames(p: float, seed: int = 0, n_customers: int = N_CUSTOMERS):
+    """Like `_generate_frames`, but each customer has 0 or 1 orders with
+    probability `p` (a "CRM contact has a shop account" style relationship)."""
+    rng = np.random.default_rng(seed)
+
+    cov = [[1.0, TRUE_COPULA_R], [TRUE_COPULA_R, 1.0]]
+    z = rng.multivariate_normal([0.0, 0.0], cov, size=n_customers)
+    age = TRUE_AGE_MEAN + TRUE_AGE_STD * z[:, 0]
+    income = np.exp(TRUE_INCOME_MU + TRUE_INCOME_SIGMA * z[:, 1])
+
+    customer_id = np.arange(n_customers, dtype=np.int64)
+    region = rng.choice(
+        list(TRUE_REGION_PROBS.keys()), size=n_customers, p=list(TRUE_REGION_PROBS.values())
+    )
+
+    signup_start = datetime(2022, 1, 1, tzinfo=timezone.utc)
+    signup_end = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    signup_range_s = (signup_end - signup_start).total_seconds()
+    signup_offset_s = rng.uniform(0.0, signup_range_s, size=n_customers)
+    signup_us = (
+        int(signup_start.timestamp()) * 1_000_000 + (signup_offset_s * 1e6).astype(np.int64)
+    )
+
+    customers_df = pl.DataFrame(
+        {
+            "customer_id": customer_id,
+            "region": region,
+            "age": age,
+            "income": income,
+            "signup_at": signup_us.astype("datetime64[us]"),
+        }
+    )
+
+    counts = rng.binomial(1, p, size=n_customers).astype(np.int64)
+    order_customer_idx = np.repeat(np.arange(n_customers), counts)
+    n_orders = order_customer_idx.size
+    order_id = np.arange(n_orders, dtype=np.int64)
+    order_customer_id = customer_id[order_customer_idx]
+    signup_us_per_order = signup_us[order_customer_idx]
+
+    delay1_s = rng.exponential(scale=TRUE_ORDERED_DELAY_MEAN_S, size=n_orders)
+    ordered_us = signup_us_per_order + (delay1_s * 1e6).astype(np.int64)
+
+    z2 = rng.normal(size=n_orders)
+    delay2_s = np.exp(TRUE_SHIPPED_MU + TRUE_SHIPPED_SIGMA * z2)
+    shipped_us = ordered_us + (delay2_s * 1e6).astype(np.int64)
+
+    order_total = np.exp(rng.normal(TRUE_ORDER_TOTAL_MU, TRUE_ORDER_TOTAL_SIGMA, size=n_orders))
+
+    orders_df = pl.DataFrame(
+        {
+            "order_id": order_id,
+            "customer_id": order_customer_id,
+            "order_total": order_total,
+            "ordered_at": ordered_us.astype("datetime64[us]"),
+            "shipped_at": shipped_us.astype("datetime64[us]"),
+        }
+    )
+
+    return {"customers": customers_df, "orders": orders_df}, counts
+
+
+def test_fit_cardinality_selects_bernoulli_when_counts_are_0_or_1():
+    p_true = 0.6
+    frames, counts = _generate_bernoulli_frames(p_true, seed=11)
+    skeleton = load_metadata(str(RETAIL_YAML))
+
+    fitted = fit_metadata(frames, skeleton)
+
+    card = fitted.tables["orders"].cardinality
+    assert card.kind == "bernoulli"
+    assert abs(card.params["p"] - p_true) < 0.02
+    assert fitted.tables["orders"].child_stride == 2
+
+    # sanity: the frame really is 0/1-only.
+    assert set(np.unique(counts)) <= {0, 1}
+
+    # the fitted metadata must still round-trip/validate.
+    d = metadata_to_dict(fitted)
+    reparsed = parse_metadata(d)
+    assert metadata_to_dict(reparsed) == d
+
+
+def test_fit_cardinality_mixed_counts_still_fits_poisson(frames_and_extras):
+    # frames_and_extras uses TRUE_CARD_LAM = 4.2 (poisson), so most parents
+    # have counts > 1 -> mixed-count frame, must NOT be classified bernoulli.
+    frames, _ = frames_and_extras
+    skeleton = load_metadata(str(RETAIL_YAML))
+
+    fitted = fit_metadata(frames, skeleton)
+    card = fitted.tables["orders"].cardinality
+    assert card.kind == "poisson"
+    assert abs(card.params["lam"] - TRUE_CARD_LAM) < 0.1

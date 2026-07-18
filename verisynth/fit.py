@@ -290,6 +290,15 @@ def _fit_cardinality(md: Metadata, t: Any, pl_frames: dict[str, pl.DataFrame]) -
     n_parents = counts.shape[0]
     lam = float(np.mean(counts)) if n_parents else 0.0
     observed_max = float(np.max(counts)) if n_parents else 0.0
+
+    # §7: if every observed per-parent count is 0 or 1 -> bernoulli{p = mean},
+    # child_stride = 2; else the poisson rule below.
+    if n_parents > 0 and bool(np.all((counts == 0) | (counts == 1))):
+        p_val = float(np.mean(counts))
+        t.cardinality = CardinalitySpec(kind="bernoulli", params={"p": p_val})
+        t.child_stride = 2
+        return observed_max, n_parents
+
     eff_max = max(1, math.ceil(observed_max * 1.5))
 
     stride = 1
@@ -305,6 +314,15 @@ def _fit_cardinality(md: Metadata, t: Any, pl_frames: dict[str, pl.DataFrame]) -
 
 
 def _cardinality_dp_entry(t: Any, observed_max: float, n_parents: int) -> _DPEntry:
+    if t.cardinality.kind == "bernoulli":
+        sensitivity = 1.0 / max(n_parents, 1)
+
+        def apply(eps_i: float, rng: np.random.Generator, t: Any = t, sensitivity: float = sensitivity) -> None:
+            p_val = laplace_value(t.cardinality.params["p"], sensitivity, eps_i, rng)
+            t.cardinality.params["p"] = float(np.clip(p_val, 0.0, 1.0))
+
+        return (1, apply)
+
     sensitivity = observed_max / max(n_parents, 1)
 
     def apply(eps_i: float, rng: np.random.Generator, t: Any = t, sensitivity: float = sensitivity) -> None:

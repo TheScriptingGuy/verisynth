@@ -141,3 +141,235 @@ def test_invalid_documents_raise_with_path(mutator):
     with pytest.raises(MetadataError) as excinfo:
         parse_metadata(doc)
     assert expected_substring in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# 4. generator: parent:{column} (master-data inheritance)
+# --------------------------------------------------------------------------
+
+
+def _two_table_doc_with_inherited_state() -> dict:
+    """A minimal root+child document where the child inherits 'state' from
+    its parent via generator: parent:state."""
+    return {
+        "version": 1,
+        "seed": 1,
+        "tables": {
+            "crm_contacts": {
+                "role": "root",
+                "rows": 100,
+                "primary_key": "contact_id",
+                "source": "crm",
+                "columns": {
+                    "contact_id": {"type": "int64", "generator": "key"},
+                    "state": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["A", "B", "C"],
+                            "probs": [0.5, 0.3, 0.2],
+                        },
+                    },
+                },
+                "derived": [{"name": "state_lower", "expr": "lower(state)"}],
+            },
+            "customers": {
+                "role": "child",
+                "parent": "crm_contacts",
+                "cardinality": {"kind": "bernoulli", "p": 0.6},
+                "child_stride": 2,
+                "primary_key": "customer_id",
+                "source": "shop",
+                "columns": {
+                    "customer_id": {"type": "int64", "generator": "key"},
+                    "contact_id": {"type": "int64", "generator": "parent_key"},
+                    "state": {"type": "string", "generator": "parent:state"},
+                },
+            },
+        },
+    }
+
+
+def test_generator_parent_column_valid():
+    doc = _two_table_doc_with_inherited_state()
+    md = parse_metadata(doc)
+    assert md.tables["customers"].columns["state"].generator == "parent:state"
+    assert md.tables["crm_contacts"].source == "crm"
+    assert md.tables["customers"].source == "shop"
+
+
+def test_generator_parent_on_root_table_invalid():
+    doc = _two_table_doc_with_inherited_state()
+    # crm_contacts is a root table: 'parent:{column}' is only valid on child
+    # tables. Add a second root column so we don't collide with the PK.
+    doc["tables"]["crm_contacts"]["columns"]["extra"] = {"type": "string", "generator": "parent:state"}
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "crm_contacts.columns.extra.generator" in str(excinfo.value)
+
+
+def test_generator_parent_nonexistent_column_invalid():
+    doc = _two_table_doc_with_inherited_state()
+    doc["tables"]["customers"]["columns"]["state"]["generator"] = "parent:does_not_exist"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "customers.columns.state.generator" in str(excinfo.value)
+
+
+def test_generator_parent_type_mismatch_invalid():
+    doc = _two_table_doc_with_inherited_state()
+    doc["tables"]["customers"]["columns"]["state"]["type"] = "int64"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "customers.columns.state.generator" in str(excinfo.value)
+
+
+def test_generator_parent_references_derived_column_invalid():
+    doc = _two_table_doc_with_inherited_state()
+    doc["tables"]["customers"]["columns"]["state"]["generator"] = "parent:state_lower"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "customers.columns.state.generator" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# 5. bernoulli{p} cardinality
+# --------------------------------------------------------------------------
+
+
+def test_bernoulli_cardinality_p_out_of_range_invalid():
+    doc = _two_table_doc_with_inherited_state()
+    doc["tables"]["customers"]["cardinality"]["p"] = 1.5
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "customers.cardinality" in str(excinfo.value)
+
+
+def test_bernoulli_cardinality_valid_with_stride_2():
+    doc = _two_table_doc_with_inherited_state()
+    doc["tables"]["customers"]["cardinality"]["p"] = 0.6
+    doc["tables"]["customers"]["child_stride"] = 2
+    md = parse_metadata(doc)
+    assert md.tables["customers"].cardinality.kind == "bernoulli"
+    assert md.tables["customers"].cardinality.params["p"] == 0.6
+    assert md.tables["customers"].child_stride == 2
+
+
+def test_bernoulli_cardinality_stride_1_invalid():
+    doc = _two_table_doc_with_inherited_state()
+    doc["tables"]["customers"]["child_stride"] = 1
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "customers.cardinality" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# 6. source: round-trip
+# --------------------------------------------------------------------------
+
+
+def test_source_round_trips_through_metadata_to_dict():
+    from verisynth.metadata import metadata_to_dict
+
+    doc = _two_table_doc_with_inherited_state()
+    md = parse_metadata(doc)
+    d = metadata_to_dict(md)
+    assert d["tables"]["crm_contacts"]["source"] == "crm"
+    assert d["tables"]["customers"]["source"] == "shop"
+
+    reparsed = parse_metadata(d)
+    assert metadata_to_dict(reparsed) == d
+
+
+def test_source_omitted_when_none():
+    from verisynth.metadata import metadata_to_dict
+
+    md = load_metadata(EXAMPLE_PATH)
+    d = metadata_to_dict(md)
+    assert "source" not in d["tables"]["customers"]
+    assert "source" not in d["tables"]["orders"]
+
+
+# --------------------------------------------------------------------------
+# 7. Categorical category-value coercion (int / bool categories survive
+#    load -> dict round-trip unchanged in type).
+# --------------------------------------------------------------------------
+
+
+def test_int_categories_survive_round_trip_as_ints():
+    from verisynth.metadata import metadata_to_dict
+
+    doc = {
+        "version": 1,
+        "seed": 1,
+        "tables": {
+            "t": {
+                "role": "root",
+                "rows": 5,
+                "primary_key": "id",
+                "columns": {
+                    "id": {"type": "int64", "generator": "key"},
+                    "score": {
+                        "type": "int64",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": [1, 2, 3],
+                            "probs": [0.2, 0.3, 0.5],
+                        },
+                    },
+                },
+            }
+        },
+    }
+    md = parse_metadata(doc)
+    categories = md.tables["t"].columns["score"].distribution.params["categories"]
+    assert categories == [1, 2, 3]
+    assert all(isinstance(c, int) and not isinstance(c, bool) for c in categories)
+
+    d = metadata_to_dict(md)
+    assert d["tables"]["t"]["columns"]["score"]["distribution"]["categories"] == [1, 2, 3]
+    assert all(
+        isinstance(c, int) and not isinstance(c, bool)
+        for c in d["tables"]["t"]["columns"]["score"]["distribution"]["categories"]
+    )
+
+    reparsed = parse_metadata(d)
+    assert metadata_to_dict(reparsed) == d
+
+
+def test_bool_categories_survive_round_trip_as_bools():
+    from verisynth.metadata import metadata_to_dict
+
+    doc = {
+        "version": 1,
+        "seed": 1,
+        "tables": {
+            "t": {
+                "role": "root",
+                "rows": 5,
+                "primary_key": "id",
+                "columns": {
+                    "id": {"type": "int64", "generator": "key"},
+                    "flag": {
+                        "type": "bool",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": [True, False],
+                            "probs": [0.7, 0.3],
+                        },
+                    },
+                },
+            }
+        },
+    }
+    md = parse_metadata(doc)
+    categories = md.tables["t"].columns["flag"].distribution.params["categories"]
+    assert categories == [True, False]
+    assert all(isinstance(c, bool) for c in categories)
+
+    d = metadata_to_dict(md)
+    assert d["tables"]["t"]["columns"]["flag"]["distribution"]["categories"] == [True, False]
+    assert all(
+        isinstance(c, bool)
+        for c in d["tables"]["t"]["columns"]["flag"]["distribution"]["categories"]
+    )

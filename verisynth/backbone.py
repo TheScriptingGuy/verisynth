@@ -21,13 +21,25 @@ class ParquetBackbone:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-    def _table_dir(self, table_name: str) -> Path:
-        d = self.out_dir / table_name
+    def _table_dir(self, table_name: str, source: str | None = None) -> Path:
+        d = self.out_dir / source / table_name if source else self.out_dir / table_name
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def write_partition(self, table_name: str, tbl: pa.Table, partition: int) -> Path:
-        path = self._table_dir(table_name) / f"part-{partition:05d}.parquet"
+    def table_glob(self, table_name: str, source: str | None = None) -> str:
+        """Return the DuckDB glob path for all partitions of ``table_name``.
+
+        ``{out}/{source}/{table}/*.parquet`` when ``source`` is set, else
+        ``{out}/{table}/*.parquet``.
+        """
+        if source:
+            return str(self.out_dir / source / table_name / "*.parquet")
+        return str(self.out_dir / table_name / "*.parquet")
+
+    def write_partition(
+        self, table_name: str, tbl: pa.Table, partition: int, source: str | None = None
+    ) -> Path:
+        path = self._table_dir(table_name, source) / f"part-{partition:05d}.parquet"
         con = duckdb.connect()
         try:
             con.register("__t", tbl)
@@ -41,7 +53,7 @@ class ParquetBackbone:
         con = duckdb.connect()
         try:
             for tname in metadata.table_order():
-                glob = str(self.out_dir / tname / "*.parquet")
+                glob = self.table_glob(tname, metadata.tables[tname].source)
                 con.execute(
                     f"CREATE OR REPLACE VIEW {tname} AS SELECT * FROM read_parquet('{glob}')"
                 )

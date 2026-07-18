@@ -10,7 +10,7 @@ import duckdb
 import polars as pl
 import yaml
 
-from .backbone import validate_dataset
+from .backbone import ParquetBackbone, validate_dataset
 from .engine import Engine
 from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
@@ -21,10 +21,11 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     engine = Engine(metadata, seed=args.seed)
     engine.generate(args.out, num_partitions=args.partitions)
 
+    backbone = ParquetBackbone(args.out)
     con = duckdb.connect()
     try:
         for tname in metadata.table_order():
-            glob = str(Path(args.out) / tname / "*.parquet")
+            glob = backbone.table_glob(tname, metadata.tables[tname].source)
             (count,) = con.execute(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()
             print(f"{tname}: {count} rows")
     finally:

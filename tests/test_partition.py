@@ -90,6 +90,30 @@ def test_child_counts_uniform_int():
     assert np.all(counts <= min(high, cap))
 
 
+def test_child_counts_bernoulli_values_mean_and_determinism():
+    p = 0.6
+    spec = CardinalitySpec(kind="bernoulli", params={"p": p})
+    parent_keys = np.arange(20_000, dtype=np.uint64)
+    counts1 = child_counts(1, "accounts", spec, parent_keys)
+    counts2 = child_counts(1, "accounts", spec, parent_keys)
+
+    assert counts1.dtype == np.int64
+    assert set(np.unique(counts1)) <= {0, 1}
+    assert abs(counts1.mean() - p) < 0.01
+    assert np.array_equal(counts1, counts2)
+
+
+def test_child_counts_bernoulli_partition_invariance():
+    spec = CardinalitySpec(kind="bernoulli", params={"p": 0.6})
+    all_keys = np.arange(1000, dtype=np.uint64)
+    sliced = all_keys[300:400]
+    direct = np.arange(300, 400, dtype=np.uint64)
+
+    c_sliced = child_counts(7, "accounts", spec, sliced)
+    c_direct = child_counts(7, "accounts", spec, direct)
+    assert np.array_equal(c_sliced, c_direct)
+
+
 # --------------------------------------------------------------------------
 # 3. Partition invariance of child_counts
 # --------------------------------------------------------------------------

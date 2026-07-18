@@ -47,7 +47,7 @@ def child_counts(
         counts = np.full(len(parent_keys), n, dtype=np.int64)
         return np.clip(counts, 0, cap)
 
-    cap = int(spec.params["max"])
+    cap = 1 if spec.kind == "bernoulli" else int(spec.params["max"])
     u = kernels.keyed_uniforms(seed, f"{child_table}.__cardinality__", parent_keys)
     counts = make_marginal(spec).ppf(u).astype(np.int64)
     return np.clip(counts, 0, cap)

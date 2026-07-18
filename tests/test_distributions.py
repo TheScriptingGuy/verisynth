@@ -137,3 +137,22 @@ def test_unknown_kind_raises():
     spec = DistributionSpec(kind="not_a_kind", params={})
     with pytest.raises(ValueError):
         make_marginal(spec)
+
+
+def test_bernoulli_ppf_mean_and_values():
+    spec = CardinalitySpec(kind="bernoulli", params={"p": 0.6})
+    vals = make_marginal(spec).ppf(_u())
+    assert set(np.unique(vals)) <= {0, 1}
+    assert abs(np.mean(vals) - 0.6) < 0.01
+
+
+def test_bernoulli_ppf_p_zero_all_zero():
+    spec = CardinalitySpec(kind="bernoulli", params={"p": 0.0})
+    vals = make_marginal(spec).ppf(_u())
+    assert np.all(vals == 0)
+
+
+def test_bernoulli_ppf_p_one_all_one():
+    spec = CardinalitySpec(kind="bernoulli", params={"p": 1.0})
+    vals = make_marginal(spec).ppf(_u())
+    assert np.all(vals == 1)

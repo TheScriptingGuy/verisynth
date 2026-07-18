@@ -14,7 +14,7 @@ import pytest
 
 from verisynth.backbone import ParquetBackbone, validate_dataset
 from verisynth.engine import Engine
-from verisynth.metadata import load_metadata
+from verisynth.metadata import load_metadata, parse_metadata
 from verisynth.partition import child_counts, expand_children, root_keys
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -232,3 +232,163 @@ def test_validate_dataset_ok_then_corrupted(tmp_path):
     violations = validate_dataset(md, out_dir)
     assert violations, "expected FK violation after corrupting orders"
     assert any("customer_id" in v or "orders" in v for v in violations)
+
+
+# --------------------------------------------------------------------------
+# 7. Multi-source dataset: generator: parent:{column} inheritance,
+#    bernoulli cardinality, cross-source `source:` output routing, and a
+#    cross-table temporal anchor fed by an inherited timestamp.
+#    See TASK CARD 11 and docs/ARCHITECTURE.md §8.
+# --------------------------------------------------------------------------
+
+MULTI_SOURCE_SEED = 7
+N_CONTACTS = 2000
+
+
+def _multi_source_metadata_dict(rows: int = N_CONTACTS) -> dict:
+    return {
+        "version": 1,
+        "seed": MULTI_SOURCE_SEED,
+        "tables": {
+            "crm_contacts": {
+                "role": "root",
+                "rows": rows,
+                "primary_key": "contact_id",
+                "source": "crm",
+                "columns": {
+                    "contact_id": {"type": "int64", "generator": "key"},
+                    "state": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["A", "B", "C"],
+                            "probs": [0.5, 0.3, 0.2],
+                        },
+                    },
+                    "created_at": {
+                        "type": "timestamp",
+                        "distribution": {
+                            "kind": "datetime_uniform",
+                            "start": "2022-01-01T00:00:00",
+                            "end": "2023-01-01T00:00:00",
+                        },
+                    },
+                },
+            },
+            "customers": {
+                "role": "child",
+                "parent": "crm_contacts",
+                "cardinality": {"kind": "bernoulli", "p": 0.7},
+                "child_stride": 2,
+                "primary_key": "customer_id",
+                "source": "shop",
+                "columns": {
+                    "customer_id": {"type": "int64", "generator": "key"},
+                    "contact_id": {"type": "int64", "generator": "parent_key"},
+                    "state": {"type": "string", "generator": "parent:state"},
+                    "created_at": {"type": "timestamp", "generator": "parent:created_at"},
+                },
+            },
+            "orders": {
+                "role": "child",
+                "parent": "customers",
+                "cardinality": {"kind": "poisson", "lam": 2.0, "max": 15},
+                "child_stride": 16,
+                "primary_key": "order_id",
+                "columns": {
+                    "order_id": {"type": "int64", "generator": "key"},
+                    "customer_id": {"type": "int64", "generator": "parent_key"},
+                    "ordered_at": {
+                        "type": "timestamp",
+                        "temporal": {
+                            "anchor": "customers.created_at",
+                            "delay": {"kind": "exponential", "rate": 1.0e-6},
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+def _multi_source_metadata(rows: int = N_CONTACTS):
+    return parse_metadata(_multi_source_metadata_dict(rows))
+
+
+def test_multi_source_inheritance_and_cardinality():
+    md = _multi_source_metadata(N_CONTACTS)
+    eng = Engine(md, seed=MULTI_SOURCE_SEED)
+    tables = eng.generate_partition(0, 1)
+
+    contacts = tables["crm_contacts"]
+    customers = tables["customers"]
+    orders = tables["orders"]
+
+    contact_id = contacts.column("contact_id").to_numpy(zero_copy_only=False)
+    contact_state = contacts.column("state").to_numpy(zero_copy_only=False)
+    contact_created_at = contacts.column("created_at").to_numpy(zero_copy_only=False)
+    state_by_contact = dict(zip(contact_id.tolist(), contact_state.tolist()))
+    created_by_contact = dict(zip(contact_id.tolist(), contact_created_at.tolist()))
+
+    cust_contact_id = customers.column("contact_id").to_numpy(zero_copy_only=False)
+    cust_state = customers.column("state").to_numpy(zero_copy_only=False)
+    cust_created_at = customers.column("created_at").to_numpy(zero_copy_only=False)
+
+    # (1) inherited state equals the parent's state row-for-row (joined via
+    # contact_id).
+    expected_state = np.array([state_by_contact[cid] for cid in cust_contact_id.tolist()])
+    assert np.array_equal(cust_state, expected_state)
+
+    # (2) inherited timestamp equals parent's exactly.
+    expected_created = np.array(
+        [created_by_contact[cid] for cid in cust_contact_id.tolist()], dtype=cust_created_at.dtype
+    )
+    assert np.array_equal(cust_created_at, expected_created)
+
+    # (3) customers row count ~= 0.7 * contacts (binomial tolerance); every
+    # contact_id unique (bernoulli cardinality is at most 1 per parent).
+    n_customers = customers.num_rows
+    expected_n = 0.7 * N_CONTACTS
+    std = (N_CONTACTS * 0.7 * 0.3) ** 0.5
+    assert abs(n_customers - expected_n) < 5 * std
+    assert len(np.unique(cust_contact_id)) == len(cust_contact_id)
+
+    # (6) orders' temporal anchor ordering: order ts >= inherited created_at.
+    customer_id = customers.column("customer_id").to_numpy(zero_copy_only=False)
+    created_by_customer = dict(zip(customer_id.tolist(), cust_created_at.tolist()))
+    orders_customer_id = orders.column("customer_id").to_numpy(zero_copy_only=False)
+    ordered_at = orders.column("ordered_at").to_numpy(zero_copy_only=False)
+    order_anchor = np.array(
+        [created_by_customer[cid] for cid in orders_customer_id.tolist()], dtype=ordered_at.dtype
+    )
+    ordered_valid = ~pa.array(ordered_at).is_null().to_numpy(zero_copy_only=False)
+    assert np.all(ordered_at[ordered_valid] >= order_anchor[ordered_valid])
+
+
+def test_multi_source_partition_invariance():
+    md1 = _multi_source_metadata(N_CONTACTS)
+    single = Engine(md1, seed=MULTI_SOURCE_SEED).generate_partition(0, 1)
+
+    md3 = _multi_source_metadata(N_CONTACTS)
+    eng3 = Engine(md3, seed=MULTI_SOURCE_SEED)
+    parts = [eng3.generate_partition(p, 3) for p in range(3)]
+
+    for name in single:
+        concatenated = pa.concat_tables([parts[p][name] for p in range(3)])
+        assert concatenated.equals(single[name]), f"table {name} not partition-invariant"
+
+
+def test_multi_source_generate_writes_source_paths_and_validates(tmp_path):
+    md = _multi_source_metadata(N_CONTACTS)
+    eng = Engine(md, seed=MULTI_SOURCE_SEED)
+    out_dir = tmp_path / "out"
+    eng.generate(str(out_dir), num_partitions=2)
+
+    assert (out_dir / "crm" / "crm_contacts" / "part-00000.parquet").exists()
+    assert (out_dir / "crm" / "crm_contacts" / "part-00001.parquet").exists()
+    assert (out_dir / "shop" / "customers" / "part-00000.parquet").exists()
+    assert (out_dir / "shop" / "customers" / "part-00001.parquet").exists()
+    # orders has no `source:` -> unchanged top-level layout.
+    assert (out_dir / "orders" / "part-00000.parquet").exists()
+
+    assert validate_dataset(md, out_dir) == []

@@ -60,7 +60,7 @@ class CopulaSpec:
 class ColumnSpec:
     name: str
     type: str
-    generator: str | None = None  # "key" | "parent_key"
+    generator: str | None = None  # "key" | "parent_key" | "parent:{column}"
     distribution: DistributionSpec | None = None
     temporal: TemporalSpec | None = None
     clamp: tuple[float, float] | None = None
@@ -80,6 +80,7 @@ class TableSpec:
     child_stride: int | None = None
     copulas: list[CopulaSpec] = field(default_factory=list)
     derived: list[DerivedSpec] = field(default_factory=list)
+    source: str | None = None  # optional source-system name (see §6, §8)
 
 
 @dataclass
@@ -139,6 +140,7 @@ _CARD_SPECS: dict[str, set[str]] = {
     "poisson": {"lam", "max"},
     "uniform_int": {"low", "high", "max"},
     "fixed": {"n"},
+    "bernoulli": {"p"},
 }
 
 # Parameter names that must stay integer-typed rather than being coerced to float.
@@ -205,13 +207,20 @@ def _coerce(v: Any, int_names: set[str], key: str) -> Any:
     return v
 
 
+# Param names holding lists of category *values* (not counts/probabilities):
+# preserved exactly as loaded, with no numeric widening/coercion applied.
+_NO_COERCE_PARAMS = {"categories"}
+
+
 def _parse_distribution(path: str, d: Any) -> DistributionSpec:
     if not isinstance(d, dict) or "kind" not in d:
         raise MetadataError(f"{path}: distribution spec must be a mapping with a 'kind'")
     d = dict(d)
     kind = d.pop("kind")
     int_names = _DIST_INT_PARAMS.get(kind, set())
-    params = {k: _coerce(v, int_names, k) for k, v in d.items()}
+    params = {
+        k: (v if k in _NO_COERCE_PARAMS else _coerce(v, int_names, k)) for k, v in d.items()
+    }
     return DistributionSpec(kind=kind, params=params)
 
 
@@ -221,7 +230,9 @@ def _parse_cardinality(path: str, d: Any) -> CardinalitySpec:
     d = dict(d)
     kind = d.pop("kind")
     int_names = _CARD_INT_PARAMS.get(kind, set())
-    params = {k: _coerce(v, int_names, k) for k, v in d.items()}
+    params = {
+        k: (v if k in _NO_COERCE_PARAMS else _coerce(v, int_names, k)) for k, v in d.items()
+    }
     return CardinalitySpec(kind=kind, params=params)
 
 
@@ -316,6 +327,7 @@ def _parse_table(tname: str, tdict: Any) -> TableSpec:
         child_stride=tdict.get("child_stride"),
         copulas=copulas,
         derived=derived,
+        source=tdict.get("source"),
     )
 
 
@@ -418,6 +430,11 @@ def _validate_cardinality(path: str, card: CardinalitySpec, child_stride: int | 
         if not (low <= high):
             raise MetadataError(f"{path}: uniform_int requires low <= high")
         eff_max = p["max"]
+    elif card.kind == "bernoulli":
+        p_val = p["p"]
+        if not isinstance(p_val, (int, float)) or isinstance(p_val, bool) or not (0.0 <= p_val <= 1.0):
+            raise MetadataError(f"{path}: bernoulli 'p' must be within [0, 1] (got {p_val!r})")
+        eff_max = 1
     else:  # fixed
         eff_max = p["n"]
 
@@ -522,6 +539,11 @@ def validate(md: Metadata) -> None:
     # Pass 1: role / rows / parent-existence / cardinality-presence / child_stride.
     for tname, t in md.tables.items():
         path = f"tables.{tname}"
+        if t.source is not None:
+            if not isinstance(t.source, str) or t.source == "" or "/" in t.source:
+                raise MetadataError(
+                    f"{path}.source: must be a non-empty string without '/' (got {t.source!r})"
+                )
         if t.role not in ("root", "child"):
             raise MetadataError(f"{path}.role: must be 'root' or 'child' (got {t.role!r})")
         if t.role == "root":
@@ -560,10 +582,40 @@ def validate(md: Metadata) -> None:
                 )
 
             if c.generator is not None:
-                if c.generator not in ("key", "parent_key"):
-                    raise MetadataError(f"{cpath}.generator: must be 'key' or 'parent_key' (got {c.generator!r})")
-                if c.generator == "parent_key" and t.role != "child":
-                    raise MetadataError(f"{cpath}.generator: 'parent_key' is only valid on child tables")
+                if c.generator in ("key", "parent_key"):
+                    if c.generator == "parent_key" and t.role != "child":
+                        raise MetadataError(f"{cpath}.generator: 'parent_key' is only valid on child tables")
+                elif isinstance(c.generator, str) and c.generator.startswith("parent:"):
+                    parent_col_name = c.generator[len("parent:"):]
+                    if t.role != "child":
+                        raise MetadataError(
+                            f"{cpath}.generator: 'parent:{{column}}' is only valid on child tables"
+                        )
+                    if not parent_col_name:
+                        raise MetadataError(f"{cpath}.generator: 'parent:' must name a column")
+                    parent_table = md.tables.get(t.parent)
+                    if parent_table is None:
+                        raise MetadataError(f"{cpath}.generator: parent table {t.parent!r} not found")
+                    parent_derived_names = {d.name for d in parent_table.derived}
+                    if (
+                        parent_col_name not in parent_table.columns
+                        or parent_col_name in parent_derived_names
+                    ):
+                        raise MetadataError(
+                            f"{cpath}.generator: parent column {parent_col_name!r} does not exist "
+                            f"on table {t.parent!r} or is a derived column"
+                        )
+                    parent_col = parent_table.columns[parent_col_name]
+                    if parent_col.type != c.type:
+                        raise MetadataError(
+                            f"{cpath}.generator: parent column {parent_col_name!r} has type "
+                            f"{parent_col.type!r}, expected {c.type!r}"
+                        )
+                else:
+                    raise MetadataError(
+                        f"{cpath}.generator: must be 'key', 'parent_key', or 'parent:{{column}}' "
+                        f"(got {c.generator!r})"
+                    )
 
             if not isinstance(c.null_rate, (int, float)) or isinstance(c.null_rate, bool) or not (0.0 <= c.null_rate <= 1.0):
                 raise MetadataError(f"{cpath}.null_rate: must be within [0, 1] (got {c.null_rate!r})")
@@ -677,6 +729,8 @@ def _table_spec_to_dict(t: TableSpec) -> dict[str, Any]:
         "primary_key": t.primary_key,
         "columns": {cname: _column_spec_to_dict(c) for cname, c in t.columns.items()},
     }
+    if t.source is not None:
+        d["source"] = t.source
     if t.role == "root":
         d["rows"] = t.rows
     else:

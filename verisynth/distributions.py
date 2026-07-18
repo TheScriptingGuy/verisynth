@@ -139,6 +139,15 @@ class _FixedMarginal:
 
 
 @dataclass
+class _BernoulliMarginal:
+    p: float
+
+    def ppf(self, u: np.ndarray) -> np.ndarray:
+        u = np.asarray(u, dtype=np.float64)
+        return (u > (1.0 - self.p)).astype(np.int64)
+
+
+@dataclass
 class _ClippedUniformIntMarginal:
     low: int
     high: int
@@ -195,6 +204,8 @@ def make_marginal(spec: DistributionSpec) -> Marginal:
         return _PoissonMarginal(lam=float(p["lam"]), max=int(p["max"]))
     if kind == "fixed":
         return _FixedMarginal(n=int(p["n"]))
+    if kind == "bernoulli":
+        return _BernoulliMarginal(p=float(p["p"]))
 
     raise ValueError(f"unknown distribution kind {kind!r}")
 
