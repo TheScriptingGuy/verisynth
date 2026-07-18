@@ -70,6 +70,9 @@ class Engine:
                 else:
                     u = kernels.keyed_uniforms(seed, f"{tname}.{cname}", row_keys)
                 values = make_marginal(c.distribution).ppf(u)
+                if c.reference is not None:
+                    referenced_rows = md.tables[c.reference].rows
+                    values = np.clip(values, 0, referenced_rows - 1)
                 columns[cname] = (values, None)
 
             # --- Step 4: generator columns ------------------------------------------

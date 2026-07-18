@@ -156,3 +156,33 @@ def test_bernoulli_ppf_p_one_all_one():
     spec = CardinalitySpec(kind="bernoulli", params={"p": 1.0})
     vals = make_marginal(spec).ppf(_u())
     assert np.all(vals == 1)
+
+
+# --------------------------------------------------------------------------
+# zipf{a, n} (TASK CARD 13, docs/ARCHITECTURE.md §2)
+# --------------------------------------------------------------------------
+
+
+def test_zipf_ppf_range_and_rank0_frequency():
+    a, n = 1.5, 50
+    spec = DistributionSpec(kind="zipf", params={"a": a, "n": n})
+    vals = make_marginal(spec).ppf(_u())
+
+    assert vals.dtype == np.int64
+    assert np.all(vals >= 0) and np.all(vals <= n - 1)
+
+    j = np.arange(1, n + 1, dtype=np.float64)
+    H = np.sum(j ** (-a))
+    expected_rank0_freq = 1.0 / H
+    freq0 = np.mean(vals == 0)
+    assert abs(freq0 - expected_rank0_freq) < 0.03
+
+
+def test_zipf_ppf_frequencies_non_increasing_first_five_ranks():
+    a, n = 1.5, 50
+    spec = DistributionSpec(kind="zipf", params={"a": a, "n": n})
+    u = keyed_uniforms(1, "t.zipf_monotonic", np.arange(200_000, dtype=np.uint64))
+    vals = make_marginal(spec).ppf(u)
+
+    counts = [int(np.sum(vals == k)) for k in range(5)]
+    assert all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1))

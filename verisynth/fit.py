@@ -12,9 +12,10 @@ in declaration order (marginals), then cardinality, then copulas (pairs in
 draws. DP noise is drawn from its own ``numpy.random.default_rng(dp_seed)`` —
 it is independent of the deterministic keyed generation RNG.
 
-v0 limitation: ``datetime_uniform`` marginal bounds and temporal delay
-parameters are released WITHOUT DP noise. Only numeric/categorical marginals,
-child cardinality ``lam``, and copula correlations are perturbed.
+v0 limitation: ``datetime_uniform`` marginal bounds, temporal delay
+parameters, and ``reference:`` column ``zipf{a, n}`` popularity parameters
+are released WITHOUT DP noise. Only numeric/categorical marginals, child
+cardinality ``lam``, and copula correlations are perturbed.
 """
 
 from __future__ import annotations
@@ -71,6 +72,12 @@ def fit_metadata(
         # 1. Marginal columns, in declaration order.
         for cname, col in t.columns.items():
             if col.distribution is None:
+                continue
+            if col.reference is not None:
+                # `reference:` columns are fitted as zipf popularity profiles
+                # and released WITHOUT DP noise / epsilon cost (v0 exemption,
+                # like datetime ranges) -- see docs/ARCHITECTURE.md §7.
+                col.distribution = _fit_reference_zipf(md, col, df[cname])
                 continue
             dist, meta = _fit_marginal(df[cname], col.distribution.kind)
             col.distribution = dist
@@ -261,6 +268,53 @@ def _marginal_dp_entry(
         return (n_cat, apply)
 
     return None  # datetime marginals: released without noise, no budget cost
+
+
+_ZIPF_A_GRID = np.round(np.arange(1.05, 3.5001, 0.05), 2)
+
+
+def _fit_zipf_a(counts_desc: np.ndarray, n: int) -> float:
+    """Maximum-likelihood ``a`` over ``_ZIPF_A_GRID`` for a zipf(a, n) model,
+    given observed value counts sorted in descending-frequency order (rank 0
+    = most frequent). Vectorized over the grid and over ``n`` (no
+    grid x n Python loop). Ties -> smaller ``a`` (grid is ascending and
+    ``np.argmax`` returns the first maximum)."""
+    if counts_desc.size == 0 or n <= 0:
+        return float(_ZIPF_A_GRID[0])
+
+    ranks = np.arange(1, counts_desc.size + 1, dtype=np.float64)  # rank+1, rank 0 -> 1
+    log_ranks = np.log(ranks)
+    sum_count_log_rank = float(np.sum(counts_desc * log_ranks))
+    total_count = float(np.sum(counts_desc))
+
+    j = np.arange(1, n + 1, dtype=np.float64)
+    log_j = np.log(j)
+    # H(n, a) = sum_{j=1..n} j^-a for every grid value of a at once.
+    H = np.sum(np.exp(-_ZIPF_A_GRID[:, None] * log_j[None, :]), axis=1)
+    log_H = np.log(H)
+
+    log_likelihood = -_ZIPF_A_GRID * sum_count_log_rank - total_count * log_H
+    best_idx = int(np.argmax(log_likelihood))
+    return float(_ZIPF_A_GRID[best_idx])
+
+
+def _fit_reference_zipf(md: Metadata, col: Any, series: pl.Series) -> DistributionSpec:
+    """Fit a ``reference:`` column's popularity profile as ``zipf{a, n}``.
+
+    ``n`` is the referenced table's declared ``rows`` (skeleton). Identity of
+    the referenced values is discarded -- only the value-count profile
+    (sorted descending) drives the MLE grid search for ``a``.
+    """
+    n = md.tables[col.reference].rows
+    values = series.drop_nulls().to_numpy()
+    if values.size == 0:
+        counts_desc = np.array([], dtype=np.float64)
+    else:
+        _, counts = np.unique(values, return_counts=True)
+        counts_desc = np.sort(counts.astype(np.float64))[::-1]
+
+    a = _fit_zipf_a(counts_desc, int(n))
+    return DistributionSpec(kind="zipf", params={"a": a, "n": int(n)})
 
 
 # --------------------------------------------------------------------------

@@ -66,6 +66,7 @@ class ColumnSpec:
     clamp: tuple[float, float] | None = None
     round: bool = False
     null_rate: float = 0.0
+    reference: str | None = None  # dimension reference: name of a root table (§2)
 
 
 @dataclass
@@ -132,9 +133,14 @@ _DIST_SPECS: dict[str, set[str]] = {
     "beta": {"a", "b"},
     "uniform_int": {"low", "high"},
     "datetime_uniform": {"start", "end"},
+    "zipf": {"a", "n"},
 }
 
 _DELAY_DIST_KINDS = set(_DIST_SPECS) - {"categorical", "datetime_uniform"}
+
+# Distribution kinds whose ppf() returns an integer-valued (row-index-like)
+# sample, and are therefore eligible to back a `reference:` dimension column.
+_REFERENCE_DIST_KINDS = {"zipf", "uniform_int"}
 
 _CARD_SPECS: dict[str, set[str]] = {
     "poisson": {"lam", "max"},
@@ -144,7 +150,7 @@ _CARD_SPECS: dict[str, set[str]] = {
 }
 
 # Parameter names that must stay integer-typed rather than being coerced to float.
-_DIST_INT_PARAMS: dict[str, set[str]] = {"uniform_int": {"low", "high"}}
+_DIST_INT_PARAMS: dict[str, set[str]] = {"uniform_int": {"low", "high"}, "zipf": {"n"}}
 _CARD_INT_PARAMS: dict[str, set[str]] = {
     "uniform_int": {"low", "high", "max"},
     "poisson": {"max"},
@@ -287,6 +293,7 @@ def _parse_column(path: str, cname: str, cdict: Any) -> ColumnSpec:
         clamp=clamp,
         round=bool(cdict.get("round", False)),
         null_rate=float(cdict.get("null_rate", 0.0)),
+        reference=cdict.get("reference"),
     )
 
 
@@ -404,6 +411,12 @@ def _validate_distribution(
             ) from e
         if not (start_dt < end_dt):
             raise MetadataError(f"{path}: datetime_uniform requires start < end")
+    elif dist.kind == "zipf":
+        a, n = p.get("a"), p.get("n")
+        if not isinstance(a, (int, float)) or isinstance(a, bool) or not (a > 1):
+            raise MetadataError(f"{path}: zipf 'a' must be > 1 (got {a!r})")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise MetadataError(f"{path}: zipf 'n' must be an integer >= 1 (got {n!r})")
 
 
 def _validate_cardinality(path: str, card: CardinalitySpec, child_stride: int | None) -> None:
@@ -627,6 +640,28 @@ def validate(md: Metadata) -> None:
             if c.distribution is not None:
                 _validate_distribution(f"{cpath}.distribution", c.distribution)
 
+            if c.reference is not None:
+                if c.type != "int64":
+                    raise MetadataError(
+                        f"{cpath}.reference: column type must be 'int64' (got {c.type!r})"
+                    )
+                if c.distribution is None or c.distribution.kind not in _REFERENCE_DIST_KINDS:
+                    raise MetadataError(
+                        f"{cpath}.reference: column must have a distribution of kind "
+                        f"{sorted(_REFERENCE_DIST_KINDS)} (a reference requires an integer "
+                        "distribution; generator/temporal columns cannot carry a reference)"
+                    )
+                ref_table = md.tables.get(c.reference)
+                if ref_table is None:
+                    raise MetadataError(
+                        f"{cpath}.reference: unknown table {c.reference!r}"
+                    )
+                if ref_table.role != "root":
+                    raise MetadataError(
+                        f"{cpath}.reference: referenced table {c.reference!r} must have "
+                        f"role 'root' (got {ref_table.role!r})"
+                    )
+
         if t.primary_key not in t.columns:
             raise MetadataError(f"{path}.primary_key: must name an existing column (got {t.primary_key!r})")
         pk_col = t.columns[t.primary_key]
@@ -720,6 +755,8 @@ def _column_spec_to_dict(col: ColumnSpec) -> dict[str, Any]:
         d["round"] = True
     if col.null_rate:
         d["null_rate"] = col.null_rate
+    if col.reference is not None:
+        d["reference"] = col.reference
     return d
 
 

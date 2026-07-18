@@ -526,3 +526,85 @@ def test_fit_cardinality_mixed_counts_still_fits_poisson(frames_and_extras):
     card = fitted.tables["orders"].cardinality
     assert card.kind == "poisson"
     assert abs(card.params["lam"] - TRUE_CARD_LAM) < 0.1
+
+
+# --------------------------------------------------------------------------
+# 9. `reference:` columns fit as zipf{a, n} (TASK CARD 13,
+#    docs/ARCHITECTURE.md §7).
+# --------------------------------------------------------------------------
+
+N_DIMREF_PRODUCTS = 60
+TRUE_ZIPF_A = 1.6
+
+
+def _dimref_fit_skeleton():
+    return parse_metadata(
+        {
+            "version": 1,
+            "seed": 1,
+            "tables": {
+                "products": {
+                    "role": "root",
+                    "rows": N_DIMREF_PRODUCTS,
+                    "primary_key": "product_id",
+                    "columns": {
+                        "product_id": {"type": "int64", "generator": "key"},
+                    },
+                },
+                "sales": {
+                    "role": "root",
+                    "rows": 100,
+                    "primary_key": "sale_id",
+                    "columns": {
+                        "sale_id": {"type": "int64", "generator": "key"},
+                        "product_ref": {
+                            "type": "int64",
+                            "distribution": {"kind": "zipf", "a": 2.0, "n": N_DIMREF_PRODUCTS},
+                            "reference": "products",
+                        },
+                    },
+                },
+            },
+        }
+    )
+
+
+def _dimref_fit_frames(a: float = TRUE_ZIPF_A, n: int = N_DIMREF_PRODUCTS, n_rows: int = 50_000):
+    rng = np.random.default_rng(21)
+    k = np.arange(1, n + 1, dtype=np.float64)
+    pmf = k ** (-a)
+    pmf /= pmf.sum()
+    ranks = rng.choice(n, size=n_rows, p=pmf)  # 0-based ranks (rank 0 = most frequent)
+
+    sales_df = pl.DataFrame(
+        {
+            "sale_id": np.arange(n_rows, dtype=np.int64),
+            "product_ref": ranks.astype(np.int64),
+        }
+    )
+    return {"sales": sales_df}
+
+
+def test_fit_reference_column_recovers_zipf_a_and_n():
+    skeleton = _dimref_fit_skeleton()
+    frames = _dimref_fit_frames()
+
+    fitted = fit_metadata(frames, skeleton)
+
+    dist = fitted.tables["sales"].columns["product_ref"].distribution
+    assert dist.kind == "zipf"
+    assert dist.params["n"] == N_DIMREF_PRODUCTS
+    assert abs(dist.params["a"] - TRUE_ZIPF_A) < 0.15
+
+
+def test_fit_reference_column_dp_path_unnoised():
+    skeleton = _dimref_fit_skeleton()
+    frames = _dimref_fit_frames()
+
+    no_dp = fit_metadata(frames, skeleton)
+    dp = fit_metadata(frames, skeleton, epsilon=0.5, dp_seed=0)
+
+    no_dp_dist = no_dp.tables["sales"].columns["product_ref"].distribution
+    dp_dist = dp.tables["sales"].columns["product_ref"].distribution
+    assert dp_dist.kind == "zipf"
+    assert dp_dist.params == no_dp_dist.params

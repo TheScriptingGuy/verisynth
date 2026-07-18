@@ -3,7 +3,8 @@
 See docs/ARCHITECTURE.md §6 (normative). Each partition of each table is
 written as its own Parquet file under `{out_dir}/{table}/part-{p:05d}.parquet`;
 validation runs SQL checks (PK uniqueness, root row counts, FK integrity,
-temporal ordering) over a DuckDB view spanning all partitions of a table.
+reference integrity, temporal ordering) over a DuckDB view spanning all
+partitions of a table.
 """
 
 from __future__ import annotations
@@ -92,6 +93,24 @@ class ParquetBackbone:
                         violations.append(
                             f"{tname}: {orphan_count} rows have {fk_col!r} with no "
                             f"matching {t.parent}.{parent_pk}"
+                        )
+
+                for cname, c in t.columns.items():
+                    if c.reference is None:
+                        continue
+                    ref_table = c.reference
+                    ref_pk = metadata.tables[ref_table].primary_key
+                    (bad_count,) = con.execute(
+                        f"""
+                        SELECT count(*) FROM {tname} c
+                        LEFT JOIN {ref_table} p ON c.{cname} = p.{ref_pk}
+                        WHERE c.{cname} IS NOT NULL AND p.{ref_pk} IS NULL
+                        """
+                    ).fetchone()
+                    if bad_count:
+                        violations.append(
+                            f"{tname}.{cname}: {bad_count} rows have no matching "
+                            f"{ref_table}.{ref_pk} (reference integrity)"
                         )
 
                 for cname, c in t.columns.items():

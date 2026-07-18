@@ -392,3 +392,131 @@ def test_multi_source_generate_writes_source_paths_and_validates(tmp_path):
     assert (out_dir / "orders" / "part-00000.parquet").exists()
 
     assert validate_dataset(md, out_dir) == []
+
+
+# --------------------------------------------------------------------------
+# 8. Dimension reference columns (`reference:` + `zipf{a, n}`, TASK CARD 13,
+#    docs/ARCHITECTURE.md §2, §6, §8).
+# --------------------------------------------------------------------------
+
+DIMREF_SEED = 13
+N_PRODUCTS = 40
+N_SHOPS = 15
+
+
+def _dimref_metadata_dict(n_products: int = N_PRODUCTS, n_shops: int = N_SHOPS) -> dict:
+    return {
+        "version": 1,
+        "seed": DIMREF_SEED,
+        "tables": {
+            "products": {
+                "role": "root",
+                "rows": n_products,
+                "primary_key": "product_id",
+                "source": "inventory",
+                "columns": {
+                    "product_id": {"type": "int64", "generator": "key"},
+                    "category": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["toys", "books", "food"],
+                            "probs": [0.3, 0.3, 0.4],
+                        },
+                    },
+                    "price": {
+                        "type": "float64",
+                        "distribution": {"kind": "lognormal", "mu": 2.5, "sigma": 0.4},
+                    },
+                },
+            },
+            "shops": {
+                "role": "root",
+                "rows": n_shops,
+                "primary_key": "shop_id",
+                "source": "shop",
+                "columns": {
+                    "shop_id": {"type": "int64", "generator": "key"},
+                },
+            },
+            "sales": {
+                "role": "child",
+                "parent": "shops",
+                "cardinality": {"kind": "poisson", "lam": 3.0, "max": 20},
+                "child_stride": 32,
+                "primary_key": "sale_id",
+                "source": "shop",
+                "columns": {
+                    "sale_id": {"type": "int64", "generator": "key"},
+                    "shop_id": {"type": "int64", "generator": "parent_key"},
+                    "product_ref": {
+                        "type": "int64",
+                        "distribution": {"kind": "zipf", "a": 1.4, "n": n_products},
+                        "reference": "products",
+                    },
+                },
+            },
+        },
+    }
+
+
+def _dimref_metadata(n_products: int = N_PRODUCTS, n_shops: int = N_SHOPS):
+    return parse_metadata(_dimref_metadata_dict(n_products, n_shops))
+
+
+def test_reference_column_values_in_range_and_validates(tmp_path):
+    md = _dimref_metadata()
+    eng = Engine(md, seed=DIMREF_SEED)
+    out_dir = tmp_path / "out"
+    eng.generate(str(out_dir), num_partitions=2)
+
+    assert validate_dataset(md, out_dir) == []
+
+    tables = eng.generate_partition(0, 1)
+    product_ref = tables["sales"].column("product_ref").to_numpy(zero_copy_only=False)
+    assert product_ref.dtype == np.int64
+    assert product_ref.min() >= 0
+    assert product_ref.max() <= N_PRODUCTS - 1
+
+
+def test_reference_column_determinism_and_partition_invariance():
+    md_a = _dimref_metadata()
+    md_b = _dimref_metadata()
+    tables_a = Engine(md_a, seed=DIMREF_SEED).generate_partition(0, 1)
+    tables_b = Engine(md_b, seed=DIMREF_SEED).generate_partition(0, 1)
+    assert tables_a["sales"].equals(tables_b["sales"])
+
+    md_single = _dimref_metadata()
+    single = Engine(md_single, seed=DIMREF_SEED).generate_partition(0, 1)
+
+    md_multi = _dimref_metadata()
+    eng_multi = Engine(md_multi, seed=DIMREF_SEED)
+    parts = [eng_multi.generate_partition(p, 3) for p in range(3)]
+    concatenated = pa.concat_tables([parts[p]["sales"] for p in range(3)])
+    assert concatenated.equals(single["sales"])
+
+
+def test_reference_integrity_violation_after_corruption(tmp_path):
+    md = _dimref_metadata()
+    eng = Engine(md, seed=DIMREF_SEED)
+    out_dir = tmp_path / "out"
+    eng.generate(str(out_dir), num_partitions=2)
+
+    assert validate_dataset(md, out_dir) == []
+
+    sales_schema = eng.generate_partition(0, 1)["sales"].schema
+    bogus = pa.table(
+        {
+            "sale_id": pa.array([999_999_999], type=pa.int64()),
+            "shop_id": pa.array([0], type=pa.int64()),
+            "product_ref": pa.array([999], type=pa.int64()),
+        },
+        schema=sales_schema,
+    )
+
+    backbone = ParquetBackbone(out_dir)
+    backbone.write_partition("sales", bogus, 99, source=md.tables["sales"].source)
+
+    violations = validate_dataset(md, out_dir)
+    assert violations, "expected reference-integrity violation after corrupting sales"
+    assert any("sales.product_ref" in v for v in violations)

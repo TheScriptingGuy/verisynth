@@ -108,6 +108,17 @@ class _UniformIntMarginal:
 
 
 @dataclass
+class _ZipfMarginal:
+    a: float
+    n: int
+
+    def ppf(self, u: np.ndarray) -> np.ndarray:
+        u = np.asarray(u, dtype=np.float64)
+        out = stats.zipfian.ppf(u, self.a, self.n).astype(np.int64) - 1
+        return np.clip(out, 0, self.n - 1)
+
+
+@dataclass
 class _DatetimeUniformMarginal:
     start_us: int
     end_us: int
@@ -196,6 +207,8 @@ def make_marginal(spec: DistributionSpec) -> Marginal:
                 low=int(p["low"]), high=int(p["high"]), max=int(p["max"])
             )
         return _UniformIntMarginal(low=int(p["low"]), high=int(p["high"]))
+    if kind == "zipf":
+        return _ZipfMarginal(a=float(p["a"]), n=int(p["n"]))
     if kind == "datetime_uniform":
         start_us = _parse_epoch_us(p["start"])
         end_us = _parse_epoch_us(p["end"])

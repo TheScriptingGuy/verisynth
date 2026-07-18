@@ -373,3 +373,121 @@ def test_bool_categories_survive_round_trip_as_bools():
         isinstance(c, bool)
         for c in d["tables"]["t"]["columns"]["flag"]["distribution"]["categories"]
     )
+
+
+# --------------------------------------------------------------------------
+# 8. `zipf{a, n}` distribution kind + `reference:` dimension column
+#    (TASK CARD 13, docs/ARCHITECTURE.md §2)
+# --------------------------------------------------------------------------
+
+
+def _dimref_doc() -> dict:
+    """root products{rows: 100} + shops -> sales(child) with a fact column
+    `product_ref` that references `products` via a zipf popularity
+    distribution."""
+    return {
+        "version": 1,
+        "seed": 1,
+        "tables": {
+            "products": {
+                "role": "root",
+                "rows": 100,
+                "primary_key": "product_id",
+                "columns": {
+                    "product_id": {"type": "int64", "generator": "key"},
+                },
+            },
+            "shops": {
+                "role": "root",
+                "rows": 20,
+                "primary_key": "shop_id",
+                "columns": {
+                    "shop_id": {"type": "int64", "generator": "key"},
+                },
+            },
+            "sales": {
+                "role": "child",
+                "parent": "shops",
+                "cardinality": {"kind": "poisson", "lam": 2.0, "max": 15},
+                "child_stride": 16,
+                "primary_key": "sale_id",
+                "columns": {
+                    "sale_id": {"type": "int64", "generator": "key"},
+                    "shop_id": {"type": "int64", "generator": "parent_key"},
+                    "product_ref": {
+                        "type": "int64",
+                        "distribution": {"kind": "zipf", "a": 1.3, "n": 100},
+                        "reference": "products",
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_dimension_reference_valid_parses_and_round_trips():
+    from verisynth.metadata import metadata_to_dict
+
+    doc = _dimref_doc()
+    md = parse_metadata(doc)
+
+    product_ref = md.tables["sales"].columns["product_ref"]
+    assert product_ref.reference == "products"
+    assert product_ref.distribution.kind == "zipf"
+    assert product_ref.distribution.params["a"] == 1.3
+    assert product_ref.distribution.params["n"] == 100
+    assert isinstance(product_ref.distribution.params["n"], int)
+
+    d = metadata_to_dict(md)
+    assert d["tables"]["sales"]["columns"]["product_ref"]["reference"] == "products"
+    assert d["tables"]["sales"]["columns"]["product_ref"]["distribution"] == {
+        "kind": "zipf",
+        "a": 1.3,
+        "n": 100,
+    }
+
+    reparsed = parse_metadata(d)
+    assert metadata_to_dict(reparsed) == d
+
+
+def test_dimension_reference_to_nonexistent_table_invalid():
+    doc = _dimref_doc()
+    doc["tables"]["sales"]["columns"]["product_ref"]["reference"] = "does_not_exist"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "sales.columns.product_ref.reference" in str(excinfo.value)
+
+
+def test_dimension_reference_to_child_table_invalid():
+    doc = _dimref_doc()
+    # 'sales' is itself a child table -> referenced table must have role root.
+    doc["tables"]["sales"]["columns"]["product_ref"]["reference"] = "sales"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "sales.columns.product_ref.reference" in str(excinfo.value)
+
+
+def test_dimension_reference_on_string_column_invalid():
+    doc = _dimref_doc()
+    doc["tables"]["sales"]["columns"]["product_ref"]["type"] = "string"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "sales.columns.product_ref.reference" in str(excinfo.value)
+
+
+def test_dimension_reference_on_generator_column_invalid():
+    doc = _dimref_doc()
+    # shop_id is a generator column (parent_key); it has no distribution, so a
+    # reference on it must be rejected.
+    doc["tables"]["sales"]["columns"]["shop_id"]["reference"] = "products"
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "sales.columns.shop_id.reference" in str(excinfo.value)
+
+
+def test_zipf_distribution_a_le_1_invalid():
+    doc = _dimref_doc()
+    doc["tables"]["sales"]["columns"]["product_ref"]["distribution"]["a"] = 1.0
+    with pytest.raises(MetadataError) as excinfo:
+        parse_metadata(doc)
+    assert "sales.columns.product_ref.distribution" in str(excinfo.value)
