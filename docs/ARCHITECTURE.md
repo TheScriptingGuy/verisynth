@@ -273,9 +273,12 @@ new `Metadata` with fitted parameters:
   `max = ceil(observed max * 1.5)` (and `child_stride` = next power of two > max).
 - copula correlation: Spearman ρ per pair → Pearson on latents via `2·sin(πρ/6)`.
 - temporal delays: observed `event − anchor` seconds (nonneg); if ≥ 95% of the
-  observed delays are > 0 → `lognormal` fitted on the strictly-positive subset
-  (robust to a small fraction of zero/clamped-negative delays; preserves the
-  median of heavy-tailed delay distributions), else `exponential` with
+  observed delays are > 0 → **robust lognormal** fitted on the strictly-positive
+  subset with `mu = median(log d)`, `sigma = std(log d, ddof=0)` — median-preserving
+  by construction (for genuinely lognormal data `median(log) ≈ mean(log)`, so this
+  coincides with MLE; for multi-modal-in-log delays it anchors the typical case at
+  the cost of compressing the upper quantiles — a documented single-family
+  limitation; mixture kinds are future work). Otherwise `exponential` with
   `rate = 1/mean` over all delays.
 
 Differential privacy (optional, `epsilon` set): the *only* things released are the
