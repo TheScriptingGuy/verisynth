@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verisynth"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pyarrow",
+    "duckdb",
+    "polars",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "maturin"]
+
+[project.scripts]
+verisynth = "verisynth.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["verisynth"]
