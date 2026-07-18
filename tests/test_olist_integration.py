@@ -233,19 +233,6 @@ def test_median_price_ratio(source_frames, synth_frames):
 
 
 def test_median_approval_delay_ratio(source_frames, synth_frames):
-    # NOTE: in the committed sample, ~1.4% of orders have order_approved_at
-    # == order_purchase_timestamp (delay exactly 0), so the fit rule in
-    # verisynth/fit.py::_fit_temporal ("all d > 0 -> lognormal, else
-    # exponential") selects *exponential* for this column. The empirical
-    # delay is extremely heavy-tailed (mean ~39.4k s vs. median ~1.25k s,
-    # a ~31x mean/median ratio), so an exponential fit -- whose median is
-    # ln(2) * mean by construction -- reproduces the mean far better than
-    # the median (synthetic median ~= ln(2) * empirical mean ~= 21.7x the
-    # empirical median). This is a real, deterministic property of this
-    # dataset + the (unmodified) fit rule, not a generation bug, so the
-    # tolerance below is calibrated to that reality rather than the
-    # tighter band that would hold for a less extreme empirical delay
-    # distribution.
     def _median_delay_seconds(df: pl.DataFrame) -> float:
         delta = (
             df.select(
@@ -263,7 +250,7 @@ def test_median_approval_delay_ratio(source_frames, synth_frames):
     syn_median = _median_delay_seconds(synth_frames["orders"])
 
     ratio = syn_median / src_median
-    assert 5.0 <= ratio <= 40.0
+    assert 0.5 <= ratio <= 2.0
 
 
 def test_temporal_ordering(synth_frames):

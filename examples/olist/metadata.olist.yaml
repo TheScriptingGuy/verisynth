@@ -110,24 +110,27 @@ tables:
         temporal:
           anchor: order_purchase_timestamp
           delay:
-            kind: exponential
-            rate: 2.5388039194712642e-05
+            kind: lognormal
+            mu: 7.153833801578843
+            sigma: 2.183784494687681
         null_rate: 0.0016
       order_delivered_carrier_date:
         type: timestamp
         temporal:
           anchor: order_approved_at
           delay:
-            kind: exponential
-            rate: 4.139816407748133e-06
+            kind: lognormal
+            mu: 11.97171646700186
+            sigma: 1.0617265987479179
         null_rate: 0.0179
       order_delivered_customer_date:
         type: timestamp
         temporal:
           anchor: order_delivered_carrier_date
           delay:
-            kind: exponential
-            rate: 1.2402937025057446e-06
+            kind: lognormal
+            mu: 13.328042508194057
+            sigma: 0.8806779102401153
         null_rate: 0.0298
       order_estimated_delivery_date:
         type: timestamp
@@ -135,7 +138,7 @@ tables:
           anchor: order_purchase_timestamp
           delay:
             kind: lognormal
-            mu: 14.460688167773151
+            mu: 14.512082367781652
             sigma: 0.41224146302846254
     parent: customers
     cardinality:
@@ -171,7 +174,7 @@ tables:
           anchor: orders.order_purchase_timestamp
           delay:
             kind: lognormal
-            mu: 13.170355404965479
+            mu: 13.160587440220466
             sigma: 0.41160577377773455
     parent: orders
     cardinality:
@@ -310,8 +313,9 @@ tables:
         temporal:
           anchor: orders.order_purchase_timestamp
           delay:
-            kind: exponential
-            rate: 9.111261420790694e-07
+            kind: lognormal
+            mu: 13.75871104915853
+            sigma: 0.6378987954501665
     parent: orders
     cardinality:
       kind: poisson

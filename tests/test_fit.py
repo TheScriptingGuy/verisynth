@@ -141,14 +141,17 @@ def test_fit_no_dp_recovers_generating_params(frames_and_extras):
     assert copula.correlation[1][1] == pytest.approx(1.0)
 
     # ordered_at delay: assert whichever kind the fit rule selects on this
-    # generated data ("all d > 0" -> lognormal, else exponential), and check
-    # the params against the same statistic computed independently here.
+    # generated data (>= 95% of observed delays > 0 -> robust lognormal fitted
+    # on the strictly-positive subset with mu = median(log d), sigma =
+    # std(log d, ddof=0); else exponential over all delays), and check the
+    # params against the same statistic computed independently here.
     d1 = extras["delay1_s"]
     ordered_delay = fitted.tables["orders"].columns["ordered_at"].temporal.delay
-    if np.all(d1 > 0):
+    if np.mean(d1 > 0) >= 0.95:
         assert ordered_delay.kind == "lognormal"
-        expected_mu = float(np.mean(np.log(d1)))
-        expected_sigma = float(np.std(np.log(d1), ddof=0))
+        d1_pos = d1[d1 > 0]
+        expected_mu = float(np.median(np.log(d1_pos)))
+        expected_sigma = float(np.std(np.log(d1_pos), ddof=0))
         assert abs(ordered_delay.params["mu"] - expected_mu) < 0.05
         assert abs(ordered_delay.params["sigma"] - expected_sigma) < 0.05
     else:
@@ -158,6 +161,8 @@ def test_fit_no_dp_recovers_generating_params(frames_and_extras):
 
     # shipped_at delay: lognormal-generated delay is (for all practical
     # purposes) always strictly positive, so the rule always selects lognormal.
+    # For genuinely lognormal-generated data median(log) ~= mean(log) = mu_true,
+    # so the mu tolerance below still holds under the robust (median-of-logs) fit.
     d2 = extras["delay2_s"]
     shipped_delay = fitted.tables["orders"].columns["shipped_at"].temporal.delay
     assert shipped_delay.kind == "lognormal"
@@ -318,3 +323,103 @@ def test_fit_int_dtype_column_declared_categorical_stays_categorical():
     expected = {1: 0.4, 2: 0.2, 3: 0.2, 5: 0.2}
     for cat, p in zip(dist.params["categories"], dist.params["probs"]):
         assert abs(p - expected[cat]) < 1e-9
+
+
+# --------------------------------------------------------------------------
+# 7. Revised temporal-delay fit rule (TASK CARD 10 / docs/ARCHITECTURE.md §7):
+#    >= 95% of observed delays > 0 -> robust lognormal fitted on the
+#    strictly-positive subset (mu = median(log d), sigma = std(log d, ddof=0)
+#    -- median-preserving by construction), else exponential with
+#    rate = 1/mean over all delays.
+# --------------------------------------------------------------------------
+
+
+def _build_customer_order_frames(delay_s: np.ndarray, seed: int = 1) -> dict[str, pl.DataFrame]:
+    """Build minimal customers/orders frames (matching examples/retail.yaml's
+    structure) whose ordered_at = signup_at + delay_s exactly, so the
+    temporal-delay fit rule can be exercised on a caller-controlled delay
+    array (including exact zeros)."""
+    rng = np.random.default_rng(seed)
+    n_orders = delay_s.size
+
+    signup_start = datetime(2022, 1, 1, tzinfo=timezone.utc)
+    signup_us = np.full(n_orders, int(signup_start.timestamp()) * 1_000_000, dtype=np.int64)
+
+    customer_id = np.arange(n_orders, dtype=np.int64)
+    region = rng.choice(["NA", "EU", "APAC"], size=n_orders, p=[0.5, 0.3, 0.2])
+    age = rng.normal(TRUE_AGE_MEAN, TRUE_AGE_STD, size=n_orders)
+    income = np.exp(rng.normal(TRUE_INCOME_MU, TRUE_INCOME_SIGMA, size=n_orders))
+
+    customers_df = pl.DataFrame(
+        {
+            "customer_id": customer_id,
+            "region": region,
+            "age": age,
+            "income": income,
+            "signup_at": signup_us.astype("datetime64[us]"),
+        }
+    )
+
+    order_id = np.arange(n_orders, dtype=np.int64)
+    ordered_us = signup_us + (delay_s * 1e6).astype(np.int64)
+    z2 = rng.normal(size=n_orders)
+    delay2_s = np.exp(TRUE_SHIPPED_MU + TRUE_SHIPPED_SIGMA * z2)
+    shipped_us = ordered_us + (delay2_s * 1e6).astype(np.int64)
+    order_total = np.exp(rng.normal(TRUE_ORDER_TOTAL_MU, TRUE_ORDER_TOTAL_SIGMA, size=n_orders))
+
+    orders_df = pl.DataFrame(
+        {
+            "order_id": order_id,
+            "customer_id": customer_id,
+            "order_total": order_total,
+            "ordered_at": ordered_us.astype("datetime64[us]"),
+            "shipped_at": shipped_us.astype("datetime64[us]"),
+        }
+    )
+    return {"customers": customers_df, "orders": orders_df}
+
+
+def test_fit_temporal_delay_small_zero_fraction_stays_lognormal():
+    # 2% exact-zero delays, 98% strictly-positive lognormal delays: below the
+    # 95% threshold's complement, so the rule must still fit lognormal on the
+    # strictly-positive subset (robust to a small fraction of zero delays).
+    rng = np.random.default_rng(2)
+    n = 20_000
+    log_mu, log_sigma = 11.0, 0.5
+    delay_s = np.exp(rng.normal(log_mu, log_sigma, size=n))
+    n_zero = int(round(0.02 * n))
+    zero_idx = rng.choice(n, size=n_zero, replace=False)
+    delay_s[zero_idx] = 0.0
+
+    frames = _build_customer_order_frames(delay_s, seed=3)
+    skeleton = load_metadata(str(RETAIL_YAML))
+
+    fitted = fit_metadata(frames, skeleton)
+    ordered_delay = fitted.tables["orders"].columns["ordered_at"].temporal.delay
+
+    assert ordered_delay.kind == "lognormal"
+    d_pos = delay_s[delay_s > 0]
+    expected_mu = float(np.median(np.log(d_pos)))
+    assert abs(ordered_delay.params["mu"] - expected_mu) < 0.05
+
+
+def test_fit_temporal_delay_large_zero_fraction_selects_exponential():
+    # 20% exact-zero delays: well above the 5% zero-tolerance, so the rule
+    # must fall back to exponential fit with rate = 1/mean over all delays.
+    rng = np.random.default_rng(4)
+    n = 20_000
+    log_mu, log_sigma = 11.0, 0.5
+    delay_s = np.exp(rng.normal(log_mu, log_sigma, size=n))
+    n_zero = int(round(0.20 * n))
+    zero_idx = rng.choice(n, size=n_zero, replace=False)
+    delay_s[zero_idx] = 0.0
+
+    frames = _build_customer_order_frames(delay_s, seed=5)
+    skeleton = load_metadata(str(RETAIL_YAML))
+
+    fitted = fit_metadata(frames, skeleton)
+    ordered_delay = fitted.tables["orders"].columns["ordered_at"].temporal.delay
+
+    assert ordered_delay.kind == "exponential"
+    expected_rate = 1.0 / max(float(np.mean(delay_s)), 1e-9)
+    assert abs(ordered_delay.params["rate"] - expected_rate) / expected_rate < 0.05

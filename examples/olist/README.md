@@ -131,13 +131,21 @@ verisynth validate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth
   is fit as `datetime_uniform` over the observed min/max range, which
   flattens Olist's real growth curve and calendar seasonality (e.g. the
   Black Friday spike) into a uniform distribution.
-- The true (heavy-tailed) shape of the `order_approved_at` delay: a small
-  fraction of orders have zero observed delay, which routes the fitter to
-  an *exponential* delay model (rather than lognormal) for that column;
-  exponential's median is `ln(2) * mean`, which overstates the empirical
-  median for this particular, very heavy-tailed column. See the comment in
-  `tests/test_olist_integration.py::test_median_approval_delay_ratio` for
-  the measured effect.
+- The true shape of the `order_approved_at` delay: this column is
+  *bimodal in log-space* -- roughly the fastest 60-70% of orders are
+  auto-approved within minutes, while the rest take hours to days (manual
+  review / boleto payment confirmation). The fitter (per
+  `docs/ARCHITECTURE.md` §7) handles the ~1.4% exact-zero delays by fitting
+  a robust lognormal (`mu = median(log d)`, `sigma = std(log d)`) on the
+  strictly-positive subset; the median-based `mu` anchors the *typical*
+  delay exactly (synthetic/sample median delay ratio ~1.0), so most
+  approval delays are faithful. Zero-delay mass itself is not reproduced
+  (the fitted distribution is continuous, so no synthetic delay is exactly
+  0), and because a single lognormal cannot represent two modes, the upper
+  quartile/tail of this column is compressed relative to the real data
+  (sample Q75 ~15h vs. synthetic Q75 ~1.5h, i.e. `exp(mu + 0.674*sigma)`).
+  A mixture-of-lognormals (or similar multi-component) delay kind that
+  could capture both the fast and slow approval modes is future work.
 
 ## How to add differential privacy
 

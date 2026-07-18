@@ -400,9 +400,12 @@ def _fit_temporal(
     d_seconds = d_seconds[np.isfinite(d_seconds)]
     d_seconds = np.maximum(d_seconds, 0.0)
 
-    if d_seconds.size > 0 and bool(np.all(d_seconds > 0)):
-        logd = np.log(d_seconds)
-        mu = float(np.mean(logd))
+    frac_positive = float(np.mean(d_seconds > 0)) if d_seconds.size > 0 else 0.0
+
+    if d_seconds.size > 0 and frac_positive >= 0.95:
+        pos_d = d_seconds[d_seconds > 0]
+        logd = np.log(pos_d)
+        mu = float(np.median(logd))
         sigma = max(float(np.std(logd, ddof=0)), 1e-9)
         col.temporal.delay = DistributionSpec(kind="lognormal", params={"mu": mu, "sigma": sigma})
     else:
