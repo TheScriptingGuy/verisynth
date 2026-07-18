@@ -191,7 +191,8 @@ Rules:
   `gamma{shape, scale}`, `beta{a, b}`, `uniform_int{low, high}` (inclusive),
   `datetime_uniform{start, end}` (ISO-8601, no tz; second resolution),
   `zipf{a, n}` (0-based ranks `0..n-1` via `scipy.stats.zipfian.ppf(u, a, n) - 1`;
-  long-tail popularity).
+  long-tail popularity; finite zipfian, so `a ≥ 0` is valid and `a = 0` is the
+  uniform distribution over ranks).
 - Optional column field `reference: {table}` — a **dimension reference**
   (star-schema FK across the tree): the column samples row keys of the referenced
   table via its `distribution` and the engine clips values to `[0, rows-1]`.
@@ -301,7 +302,7 @@ new `Metadata` with fitted parameters:
   source of truth for inherited attributes.
 - `reference:` columns → `zipf{a, n}`: `n` = the referenced table's `rows` from
   the skeleton; `a` fitted by maximum likelihood over the deterministic grid
-  `a ∈ {1.05, 1.10, …, 3.50}` against the observed rank-frequency profile of the
+  `a ∈ {0.00, 0.05, …, 3.50}` against the observed rank-frequency profile of the
   column's value counts (identity of referenced values is discarded — only the
   popularity profile is released). Zipf parameters are released without DP noise
   (documented v0 limitation, like datetime ranges).
