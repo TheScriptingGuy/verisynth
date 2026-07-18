@@ -20,6 +20,10 @@ byte-identical regardless of partition count.
 - **Gaussian copulas** preserve cross-column correlation; **temporal delay
   propagation** keeps event sequences (e.g. signup → order → shipment) ordered
   and realistically distributed.
+- **`verisynth explain`** renders any metadata document as a plain-language
+  Markdown explanation (structure, distributions, correlations, temporal
+  chains, cross-source relationships, privacy posture) for readers who don't
+  read the DSL. See `examples/olist/EXPLAIN.md` for a generated example.
 - **Multi-source datasets**: tables can be grouped into named source systems
   (`source: crm`, `source: shop`) with a master source owning shared entities —
   downstream tables inherit master attributes via `generator: parent:{column}`,
@@ -54,6 +58,9 @@ verisynth generate -m examples/retail.yaml -o out/ --partitions 4 --seed 42
 
 # check PK/FK integrity, row counts, and temporal ordering of the output
 verisynth validate -m examples/retail.yaml -o out/
+
+# render a metadata document as a plain-language Markdown explanation
+verisynth explain -m examples/retail.yaml -o explain.md
 
 # fit metadata parameters from real data (one {table}.parquet per table),
 # optionally with differential privacy on the released parameters

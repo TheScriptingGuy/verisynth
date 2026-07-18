@@ -13,6 +13,7 @@ import yaml
 
 from .backbone import ParquetBackbone, validate_dataset
 from .engine import Engine
+from .explain import explain_metadata
 from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
 from .scanner import render_report, report_to_dict, scan_directory
@@ -83,6 +84,20 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_explain(args: argparse.Namespace) -> int:
+    metadata = load_metadata(args.metadata)
+    doc = explain_metadata(metadata)
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            f.write(doc)
+        print(f"wrote {out_path}")
+    else:
+        print(doc)
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     chat = Chat(assume_yes=args.yes)
     try:
@@ -138,6 +153,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "-y", "--yes", action="store_true", help="accept every suggestion (non-interactive)"
     )
     p_init.set_defaults(func=_cmd_init)
+
+    p_explain = sub.add_parser(
+        "explain",
+        help="render a metadata document as a plain-language Markdown explanation",
+    )
+    p_explain.add_argument("-m", "--metadata", required=True)
+    p_explain.add_argument(
+        "-o", "--out", default=None, help="write to this .md file instead of stdout"
+    )
+    p_explain.set_defaults(func=_cmd_explain)
 
     return parser
 
