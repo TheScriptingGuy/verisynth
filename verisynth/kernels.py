@@ -29,13 +29,18 @@ else:
 
         def keyed_hash(seed: int, namespace: str, keys: np.ndarray, draw: int = 0) -> np.ndarray:
             keys = np.ascontiguousarray(keys, dtype=np.uint64)
-            return _rust.keyed_hash(seed, namespace, keys, draw)
+            seed_u = int(seed) % (1 << 64)
+            draw_u = int(draw) % (1 << 64)
+            return _rust.keyed_hash(seed_u, namespace, keys, draw_u)
 
         def keyed_uniforms(seed: int, namespace: str, keys: np.ndarray, draw: int = 0) -> np.ndarray:
             keys = np.ascontiguousarray(keys, dtype=np.uint64)
-            return _rust.keyed_uniforms(seed, namespace, keys, draw)
+            seed_u = int(seed) % (1 << 64)
+            draw_u = int(draw) % (1 << 64)
+            return _rust.keyed_uniforms(seed_u, namespace, keys, draw_u)
 
         def inv_norm_cdf(u: np.ndarray) -> np.ndarray:
+            u = np.ascontiguousarray(u, dtype=np.float64)
             return _rust.inv_norm_cdf(u)
 
     except ImportError:
