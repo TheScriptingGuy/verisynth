@@ -169,6 +169,10 @@ def _build_inv_shipments(data_dir: Path, seed: int) -> pl.DataFrame:
 
     return pl.DataFrame(
         {
+            # Deterministic row-index primary key: needed since edi_shipments
+            # (prepare_docs_data.py) is a child of inv_shipments, so fit
+            # joins on this column. Consumes no RNG draws.
+            "shipment_id": np.arange(n, dtype=np.int64),
             "order_id": shippable["order_id"].to_list(),
             "warehouse": warehouse,
             "carrier": carrier,

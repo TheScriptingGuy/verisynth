@@ -12,6 +12,7 @@ import polars as pl
 import yaml
 
 from .backbone import ParquetBackbone, validate_dataset
+from .documents import document_path
 from .engine import Engine
 from .explain import explain_metadata
 from .fit import fit_metadata
@@ -34,6 +35,11 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             print(f"{tname}: {count} rows")
     finally:
         con.close()
+
+    for tname in metadata.table_order():
+        t = metadata.tables[tname]
+        if t.format is not None:
+            print(f"{tname}: wrote {document_path(args.out, t)}")
     return 0
 
 
@@ -179,7 +185,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_scan = sub.add_parser(
         "scan", help="scan real data files and report detected keys, relations, cardinality"
     )
-    p_scan.add_argument("--input", required=True, help="dir with {table}.parquet/.csv files")
+    p_scan.add_argument(
+        "--input", required=True, help="dir with {table}.parquet/.csv/.json/.jsonl/.xml files"
+    )
     p_scan.add_argument("--json", action="store_true", help="emit the report as JSON")
     p_scan.set_defaults(func=_cmd_scan)
 

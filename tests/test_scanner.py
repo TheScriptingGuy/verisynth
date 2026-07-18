@@ -7,6 +7,8 @@ renderers backing `verisynth scan`.
 
 from __future__ import annotations
 
+import json
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -208,3 +210,126 @@ def test_report_dict_and_render(data_dir):
     assert "customers" in text
     assert "fk -> customers.customer_id" in text
     assert "1--N" in text
+
+
+# --------------------------------------------------------------------------
+# JSON / XML loading
+# --------------------------------------------------------------------------
+
+N_JSON_CUSTOMERS = 20
+
+
+def test_json_loading(tmp_path):
+    customers = [
+        {"customer_id": i, "state": ["NL", "BE", "DE"][i % 3]} for i in range(N_JSON_CUSTOMERS)
+    ]
+    (tmp_path / "customers.json").write_text(json.dumps(customers))
+
+    lines = []
+    for i in range(50):
+        cust = i % N_JSON_CUSTOMERS
+        lines.append(
+            json.dumps(
+                {
+                    "order_id": i,
+                    "customer_id": cust,
+                    "amount": 10.0 + i,
+                    "created_at": f"2022-01-{(i % 28) + 1:02d}T00:00:00",
+                }
+            )
+        )
+    (tmp_path / "orders.jsonl").write_text("\n".join(lines))
+
+    report = scan_directory(tmp_path)
+    assert set(report.tables) == {"customers", "orders"}
+
+    cust = report.tables["customers"]
+    assert cust.pk == "customer_id"
+    assert cust.columns["customer_id"].type == "int64"
+    assert cust.columns["state"].type == "string"
+
+    orders = report.tables["orders"]
+    assert orders.pk == "order_id"
+    assert orders.columns["order_id"].type == "int64"
+    assert orders.columns["amount"].type == "float64"
+    assert orders.columns["created_at"].type == "timestamp"
+
+    rels = report.relations_of("orders")
+    assert len(rels) == 1
+    assert (rels[0].parent, rels[0].parent_key, rels[0].child_column) == (
+        "customers",
+        "customer_id",
+        "customer_id",
+    )
+
+
+def test_json_nested_struct_flattening(tmp_path):
+    records = [
+        {"order_id": i, "customer": {"customer_id": i % 5, "state": "NL"}} for i in range(10)
+    ]
+    (tmp_path / "orders.json").write_text(json.dumps(records))
+
+    report = scan_directory(tmp_path)
+    orders = report.tables["orders"]
+    assert "customer_id" in orders.columns
+    assert "state" in orders.columns
+    assert "customer" not in orders.columns
+
+    # Collision: a top-level `id` field plus a nested struct field also named
+    # `id` -> the struct's field falls back to `{struct_column}_{field}`.
+    collide = [{"id": i, "nested": {"id": i * 2, "label": "x"}} for i in range(5)]
+    d2 = tmp_path / "collide"
+    d2.mkdir()
+    (d2 / "things.json").write_text(json.dumps(collide))
+
+    report2 = scan_directory(d2)
+    things = report2.tables["things"]
+    assert "id" in things.columns
+    assert "nested_id" in things.columns
+    assert "label" in things.columns
+    assert things.columns["id"].n_unique == 5
+    assert things.columns["nested_id"].n_unique == 5
+
+
+def _shipments_xml(n: int) -> str:
+    root = ET.Element("shipments")
+    for i in range(n):
+        s = ET.SubElement(root, "shipment")
+        ET.SubElement(s, "shipment_id").text = str(i)
+        ET.SubElement(s, "warehouse").text = ["W1", "W2"][i % 2]
+        routing = ET.SubElement(s, "routing")
+        ET.SubElement(routing, "carrier").text = ["UPS", "DHL"][i % 2]
+        ET.SubElement(s, "created_at").text = f"2022-02-{(i % 28) + 1:02d}T00:00:00"
+        if i % 3 == 0:
+            ET.SubElement(s, "notes").text = "handled with care"
+    return ET.tostring(root, encoding="unicode")
+
+
+def test_xml_loading(tmp_path):
+    (tmp_path / "shipments.xml").write_text(_shipments_xml(15))
+
+    report = scan_directory(tmp_path)
+    ships = report.tables["shipments"]
+    assert ships.rows == 15
+    assert ships.pk == "shipment_id"
+    assert ships.columns["shipment_id"].type == "int64"
+    assert ships.columns["warehouse"].type == "string"
+    assert ships.columns["carrier"].type == "string"
+    assert ships.columns["created_at"].type == "timestamp"
+    assert ships.columns["notes"].null_rate > 0
+
+
+def test_mixed_directory_loading(tmp_path):
+    pl.DataFrame({"widget_id": np.arange(5, dtype=np.int64), "name": ["a", "b", "c", "d", "e"]}).write_parquet(
+        tmp_path / "widgets.parquet"
+    )
+    (tmp_path / "gadgets.json").write_text(
+        json.dumps([{"gadget_id": i, "label": "g"} for i in range(5)])
+    )
+    (tmp_path / "shipments.xml").write_text(_shipments_xml(5))
+
+    report = scan_directory(tmp_path)
+    assert set(report.tables) == {"widgets", "gadgets", "shipments"}
+    assert report.tables["widgets"].pk == "widget_id"
+    assert report.tables["gadgets"].pk == "gadget_id"
+    assert report.tables["shipments"].pk == "shipment_id"

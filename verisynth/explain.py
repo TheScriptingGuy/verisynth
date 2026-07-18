@@ -298,6 +298,19 @@ def _render_table(md: Metadata, tname: str) -> list[str]:
         lines.append(f"Child of `{t.parent}`: {phrase}.")
     lines.append("")
 
+    if t.format is not None:
+        kind_desc = {
+            "json": "a JSON document file",
+            "jsonl": "a JSON Lines document file",
+            "xml": "an XML document file",
+        }.get(t.format.kind, f"{t.format.kind} documents")
+        sentence = f"Also rendered as {kind_desc}"
+        if t.format.schemas:
+            names = ", ".join(f"`{s}`" for s in t.format.schemas)
+            sentence += f" shaped by {names}"
+        lines.append(sentence + ".")
+        lines.append("")
+
     for cname, col in t.columns.items():
         lines.append(f"- **{cname}** ({col.type}): {_describe_column(t, cname)}")
     lines.append("")
@@ -345,7 +358,7 @@ def explain_metadata(md: Metadata) -> str:
     source_parts = []
     for src in named_sources:
         k = sum(1 for tname in order if md.tables[tname].source == src)
-        source_parts.append(f"{src} ({k} tables)")
+        source_parts.append(f"{src} ({k} table{'s' if k != 1 else ''})")
     if has_unassigned:
         source_parts.append("unassigned")
     sources_desc = ", ".join(source_parts) if source_parts else "unassigned"

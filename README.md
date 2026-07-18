@@ -29,6 +29,15 @@ byte-identical regardless of partition count.
   downstream tables inherit master attributes via `generator: parent:{column}`,
   so the generated sources agree row-for-row by construction. See
   `examples/olist/` for a two-source CRM + shop example.
+- **JSON / XML document synthesis**: a table with a `format:` block is also
+  rendered as a JSON, JSON Lines, or XML document file — flat (one object or
+  element per row) or shaped by one or more **JSON Schema** / **XSD** files
+  (nested objects/elements group flat columns by leaf name; `$ref` and
+  `xs:include`/`xs:import` across files are supported). Documents are written
+  from the canonical Parquet via DuckDB, ordered by primary key, so they are
+  byte-identical for any partition count; `verisynth validate` checks them, and
+  the scanner accepts `.json`/`.jsonl`/`.xml` input files too. See the `web`
+  (JSON) and `edi` (XML) sources in `examples/olist/`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design, including
 the normative hash-chain and metadata DSL specs.

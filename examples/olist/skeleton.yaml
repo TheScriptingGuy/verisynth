@@ -30,6 +30,10 @@ tables:
     cardinality: {kind: poisson, lam: 0.45, max: 8}
     child_stride: 16
     primary_key: ticket_id
+    # Schema-less document synthesis (docs/ARCHITECTURE.md §11): besides the
+    # Parquet partitions, render the table as a flat JSON Lines feed (one
+    # object per row, all columns) -- the CRM's ticket-event export.
+    format: {kind: jsonl}
     columns:
       ticket_id: {type: int64, generator: key}
       contact_id: {type: int64, generator: parent_key}
@@ -229,3 +233,61 @@ tables:
       handed_over_at:
         type: timestamp
         temporal: {anchor: picked_at, delay: {kind: lognormal, mu: 9.9, sigma: 0.9}}
+  # --- Web source: the storefront's own order-event export, rendered as a
+  # schema-shaped JSON document (docs/ARCHITECTURE.md §11 and
+  # prepare_docs_data.py). One web event per shop order (fit recovers
+  # bernoulli p = 1.0): status and placed_at are *inherited* from the order
+  # (generator: parent:{column}), so the JSON export can never disagree with
+  # the relational shop source; device/utm_source are web-only attributes.
+  # The two JSON Schemas shape the records: leaf property names match
+  # columns, and the nested `attribution` object (a $ref into
+  # web_common.schema.json) groups the flat device/utm_source columns. ---
+  web_orders:
+    role: child
+    parent: orders
+    source: web
+    cardinality: {kind: bernoulli, p: 1.0}
+    child_stride: 2
+    primary_key: web_order_id
+    format:
+      kind: json
+      schemas: [schemas/web_order.schema.json, schemas/web_common.schema.json]
+    columns:
+      web_order_id: {type: int64, generator: key}
+      order_id: {type: int64, generator: parent_key}
+      status: {type: string, generator: "parent:order_status"}
+      placed_at: {type: timestamp, generator: "parent:order_purchase_timestamp"}
+      device:
+        type: string
+        distribution: {kind: categorical, categories: [mobile, desktop], probs: [0.6, 0.4]}
+      utm_source:
+        type: string
+        distribution: {kind: categorical, categories: [direct, google], probs: [0.5, 0.5]}
+  # --- EDI source: one shipment-notification message per inventory shipment
+  # order, rendered as an XSD-shaped XML document (docs/ARCHITECTURE.md §11).
+  # warehouse/carrier/dispatched_at are inherited from inv_shipments, so the
+  # XML messages agree row-for-row with the inventory source; service_level
+  # is the EDI-only attribute. The XSDs (edi_shipment.xsd includes
+  # edi_common.xsd) shape each <shipment>: the nested <routing> element
+  # (named complexType RoutingType) groups warehouse + carrier. ---
+  edi_shipments:
+    role: child
+    parent: inv_shipments
+    source: edi
+    cardinality: {kind: bernoulli, p: 1.0}
+    child_stride: 2
+    primary_key: edi_message_id
+    format:
+      kind: xml
+      root: shipments
+      record: shipment
+      schemas: [schemas/edi_shipment.xsd, schemas/edi_common.xsd]
+    columns:
+      edi_message_id: {type: int64, generator: key}
+      shipment_id: {type: int64, generator: parent_key}
+      service_level:
+        type: string
+        distribution: {kind: categorical, categories: [standard, express], probs: [0.85, 0.15]}
+      warehouse: {type: string, generator: "parent:warehouse"}
+      carrier: {type: string, generator: "parent:carrier"}
+      dispatched_at: {type: timestamp, generator: "parent:handed_over_at"}

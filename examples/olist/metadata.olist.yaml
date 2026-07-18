@@ -189,6 +189,8 @@ tables:
           - 0.39624202316237295
         null_rate: 0.25
     source: crm
+    format:
+      kind: jsonl
     parent: crm_contacts
     cardinality:
       kind: poisson
@@ -770,4 +772,99 @@ tables:
     cardinality:
       kind: bernoulli
       p: 0.9812342812923196
+    child_stride: 2
+  web_orders:
+    role: child
+    primary_key: web_order_id
+    columns:
+      web_order_id:
+        type: int64
+        generator: key
+      order_id:
+        type: int64
+        generator: parent_key
+      status:
+        type: string
+        generator: parent:order_status
+      placed_at:
+        type: timestamp
+        generator: parent:order_purchase_timestamp
+      device:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - desktop
+          - mobile
+          - tablet
+          probs:
+          - 0.3271425807699749
+          - 0.6227510156703424
+          - 0.050106403559682725
+      utm_source:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - direct
+          - email
+          - google
+          - social
+          probs:
+          - 0.3987231572838073
+          - 0.0978267879022377
+          - 0.349713032823886
+          - 0.153737021990069
+    source: web
+    format:
+      kind: json
+      schemas:
+      - schemas/web_order.schema.json
+      - schemas/web_common.schema.json
+    parent: orders
+    cardinality:
+      kind: bernoulli
+      p: 1.0
+    child_stride: 2
+  edi_shipments:
+    role: child
+    primary_key: edi_message_id
+    columns:
+      edi_message_id:
+        type: int64
+        generator: key
+      shipment_id:
+        type: int64
+        generator: parent_key
+      service_level:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - express
+          - standard
+          probs:
+          - 0.15595425867507887
+          - 0.8440457413249212
+      warehouse:
+        type: string
+        generator: parent:warehouse
+      carrier:
+        type: string
+        generator: parent:carrier
+      dispatched_at:
+        type: timestamp
+        generator: parent:handed_over_at
+    source: edi
+    format:
+      kind: xml
+      schemas:
+      - schemas/edi_shipment.xsd
+      - schemas/edi_common.xsd
+      root: shipments
+      record: shipment
+    parent: inv_shipments
+    cardinality:
+      kind: bernoulli
+      p: 1.0
     child_stride: 2

@@ -189,3 +189,10 @@ class Engine:
             tables = self.generate_partition(p, num_partitions)
             for tname, tbl in tables.items():
                 backbone.write_partition(tname, tbl, p, source=self.metadata.tables[tname].source)
+
+        # Tables with a `format:` block are additionally rendered as JSON/XML
+        # document files from the partitions just written (docs/ARCHITECTURE.md
+        # §11). Imported here to keep documents an optional leaf of the graph.
+        from .documents import write_documents
+
+        write_documents(self.metadata, out_dir)

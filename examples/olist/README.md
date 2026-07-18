@@ -4,10 +4,11 @@
 
 An end-to-end verisynth example built from the **Olist Brazilian E-Commerce**
 public dataset. It shows the full fit -> generate -> validate pipeline on a
-real, nine-table relational dataset spanning **three source systems**
-(shop, CRM, inventory) with categorical, numeric, and temporal (delay-chain)
-columns, Gaussian-copula correlations, and a fitted zipf popularity
-dimension reference, rather than the synthetic data in `examples/retail.yaml`.
+real, eleven-table relational dataset spanning **five source systems**
+(shop, CRM, inventory, web, EDI) with categorical, numeric, and temporal
+(delay-chain) columns, Gaussian-copula correlations, a fitted zipf popularity
+dimension reference, and JSON/XML **document synthesis** (schema-shaped and
+schema-less), rather than the synthetic data in `examples/retail.yaml`.
 
 Files:
 
@@ -18,6 +19,13 @@ Files:
 - `prepare_inventory_data.py` -- builds a third source, a product inventory
   system, from the raw product catalog plus the shop sample (see "Third
   source: product inventory" below).
+- `prepare_docs_data.py` -- synthesizes two document-oriented sources, a
+  web storefront export and an EDI shipment-message feed, as row-for-row
+  mirrors of `orders` / `inv_shipments` (see "Document sources" below).
+- `schemas/` -- the JSON Schemas (`web_order.schema.json` +
+  `web_common.schema.json`, linked by `$ref`) and XSDs
+  (`edi_shipment.xsd` includes `edi_common.xsd`) that shape the generated
+  JSON/XML documents (docs/ARCHITECTURE.md §11).
 - `skeleton.yaml` -- structural metadata (tables, keys, cardinalities,
   copula groups, temporal anchors) with placeholder distribution
   parameters, to be filled in by `verisynth fit`.
@@ -34,9 +42,10 @@ Files:
   `order_reviews.parquet`) plus 25,000 synthesized CRM contacts
   (`crm_contacts.parquet`, `crm_tickets.parquet`) plus a real
   ~9,361-product inventory catalog and its synthesized shipment orders
-  (`inv_products.parquet`, `inv_shipments.parquet`) -- see "Attribution &
-  license" below -- small enough (~4.3 MB total) to keep in the repo so the
-  integration tests always run.
+  (`inv_products.parquet`, `inv_shipments.parquet`) plus the two synthesized
+  document-source mirrors (`web_orders.parquet`, `edi_shipments.parquet`) --
+  see "Attribution & license" below -- small enough (~4.9 MB total) to keep
+  in the repo so the integration tests always run.
 
 ## Attribution & license
 
@@ -68,6 +77,7 @@ ShareAlike terms; consult the license before any other reuse.
 | `olist_sellers_dataset`, `olist_geolocation_dataset` | *(not modeled)* | sellers are shared across many orders (many-to-many via order_items, unlike the single-owner product catalog) and geolocation keys off zip-code prefix, neither of which fits the tree-shaped parent/child (or single dimension-reference) model. Modeling them would require multi-parent / many-to-many support that is out of scope for this example. |
 | *(synthesized, `prepare_crm_data.py`)* | `crm_contacts`, `crm_tickets` | a second **CRM source**, root of the whole tree; see "Two sources" below. |
 | *(synthesized, `prepare_inventory_data.py`)* | `inv_shipments` | shipment orders created by the inventory system from shop orders; child of `orders`; see "Third source: product inventory" below. |
+| *(synthesized, `prepare_docs_data.py`)* | `web_orders`, `edi_shipments` | document-oriented mirrors of `orders` / `inv_shipments`, rendered as schema-shaped JSON and XML; see "Document sources" below. |
 
 ## Data cleaning applied
 
@@ -204,11 +214,13 @@ tracks the *real* committed sample's top-product share (a genuine
 real-data-fidelity check, not just self-consistency with the fitted pmf it
 was derived from) within 0.02 absolute -- both are well under 2%.
 
-Output layout now has three per-source directories:
+Output layout now has five per-source directories (document files sit next
+to the Parquet partitions of their source):
 
 ```
 {out}/crm/crm_contacts/part-00000.parquet, ...
 {out}/crm/crm_tickets/part-00000.parquet, ...
+{out}/crm/crm_tickets.jsonl              <- schema-less JSON Lines feed
 {out}/shop/customers/part-00000.parquet, ...
 {out}/shop/orders/part-00000.parquet, ...
 {out}/shop/order_items/part-00000.parquet, ...
@@ -216,7 +228,50 @@ Output layout now has three per-source directories:
 {out}/shop/order_reviews/part-00000.parquet, ...
 {out}/inventory/inv_products/part-00000.parquet, ...
 {out}/inventory/inv_shipments/part-00000.parquet, ...
+{out}/web/web_orders/part-00000.parquet, ...
+{out}/web/web_orders.json                <- shaped by schemas/web_order.schema.json
+{out}/edi/edi_shipments/part-00000.parquet, ...
+{out}/edi/edi_shipments.xml              <- shaped by schemas/edi_shipment.xsd
 ```
+
+## Document sources: web (JSON) and EDI (XML)
+
+Two further sources exist only as **document exports** (docs/ARCHITECTURE.md
+§11) layered on the relational tree via `prepare_docs_data.py`:
+
+- **`web_orders`** (`source: web`, child of `orders`) is the storefront's
+  own order-event export: exactly one event per shop order
+  (`cardinality: bernoulli{p: 1.0}`, fit from the mirror sample). `status`
+  and `placed_at` are **inherited** (`generator: parent:order_status` /
+  `parent:order_purchase_timestamp`), so the JSON export can never disagree
+  with the relational shop source; `device` and `utm_source` are authored
+  web-only attributes (constants at the top of `prepare_docs_data.py`, fit
+  back within ~0.01 like the CRM ones). Its `format:` block renders the
+  table as `web/web_orders.json`: a JSON **array** shaped by
+  `schemas/web_order.schema.json` -- leaf property names match columns, and
+  the nested `attribution` object (a `$ref` into
+  `schemas/web_common.schema.json`, exercising multi-schema resolution)
+  groups the flat `device`/`utm_source` columns.
+- **`edi_shipments`** (`source: edi`, child of `inv_shipments`) is the EDI
+  shipment-notification feed: one message per inventory shipment order,
+  with `warehouse`/`carrier`/`dispatched_at` inherited from the
+  `inv_shipments` row and an authored `service_level`. Its `format:` block
+  renders `edi/edi_shipments.xml`: `<shipments>` wrapping one `<shipment>`
+  per row, shaped by `schemas/edi_shipment.xsd` (which `xs:include`s
+  `schemas/edi_common.xsd` for the named `RoutingType` -- the nested
+  `<routing>` element groups `warehouse` + `carrier`).
+- **`crm_tickets`** additionally demonstrates the **schema-less** path: a
+  bare `format: {kind: jsonl}` renders the flat JSON Lines feed
+  `crm/crm_tickets.jsonl` with one object per row, no schema involved.
+
+Documents are rendered from the canonical Parquet partitions with DuckDB,
+ordered by primary key, so each file is byte-identical for any
+`--partitions` count. `verisynth validate` checks that every declared
+document exists and its record count matches the Parquet data, and since
+the scanner also *reads* `.json`/`.jsonl`/`.xml`, a directory of generated
+documents can itself be scanned (`verisynth scan --input ...`) -- nested
+objects/elements flatten back to the leaf-named flat columns they were
+shaped from.
 
 ## How to regenerate from full data
 
@@ -248,17 +303,25 @@ python examples/olist/prepare_inventory_data.py \
     --data-dir examples/olist/data \
     --out examples/olist/data
 
-# 5. Fit metadata parameters from all three sources (skeleton.table_order()
-#    now covers all 9 tables -- crm_*.parquet and inv_*.parquet must exist
-#    alongside the shop *.parquet files under --input):
+# 5. Build the document-source mirrors (web + EDI) from the shop and
+#    inventory samples just written:
+python examples/olist/prepare_docs_data.py \
+    --data-dir examples/olist/data \
+    --out examples/olist/data
+
+# 6. Fit metadata parameters from all five sources (skeleton.table_order()
+#    now covers all 11 tables -- crm_*.parquet, inv_*.parquet,
+#    web_orders.parquet and edi_shipments.parquet must exist alongside the
+#    shop *.parquet files under --input):
 verisynth fit --input examples/olist/data \
     -m examples/olist/skeleton.yaml \
     -o examples/olist/metadata.olist.yaml
 
-# 6. Generate a synthetic dataset:
+# 7. Generate a synthetic dataset (writes the Parquet partitions AND the
+#    crm_tickets.jsonl / web_orders.json / edi_shipments.xml documents):
 verisynth generate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth --partitions 2
 
-# 7. Validate it:
+# 8. Validate it (includes the document files):
 verisynth validate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth
 ```
 
@@ -305,6 +368,11 @@ example's fitted metadata.
   `delivered`/`shipped` `order_status` share), `warehouse`/`carrier`
   frequencies, and the `created_at -> picked_at -> handed_over_at` delay
   chain anchored on the order's purchase time.
+- The document sources' authored attributes (`device`/`utm_source` on the
+  web export, `service_level` on the EDI feed) and -- by construction, not
+  statistically -- the row-for-row agreement of every inherited field
+  (`status`, `placed_at`, `warehouse`, `carrier`, `dispatched_at`) between
+  the JSON/XML documents and the relational tables they mirror.
 
 ## What is not preserved
 

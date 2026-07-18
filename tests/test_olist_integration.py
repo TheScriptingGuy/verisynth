@@ -37,9 +37,11 @@ SKELETON_PATH = OLIST_DIR / "skeleton.yaml"
 FITTED_PATH = OLIST_DIR / "metadata.olist.yaml"
 DATA_DIR = OLIST_DIR / "data"
 
-# All 9 tables across the three source systems (crm: crm_contacts,
+# All 11 tables across the five source systems (crm: crm_contacts,
 # crm_tickets; shop: customers, orders, order_items, order_payments,
-# order_reviews; inventory: inv_products, inv_shipments).
+# order_reviews; inventory: inv_products, inv_shipments; web: web_orders;
+# edi: edi_shipments — the two document sources, TASK CARD 17 /
+# docs/ARCHITECTURE.md §11).
 TABLE_NAMES = (
     "crm_contacts",
     "crm_tickets",
@@ -50,6 +52,8 @@ TABLE_NAMES = (
     "order_reviews",
     "inv_products",
     "inv_shipments",
+    "web_orders",
+    "edi_shipments",
 )
 
 SOURCE_TABLES = (
@@ -62,6 +66,8 @@ SOURCE_TABLES = (
     ("shop", "order_reviews"),
     ("inventory", "inv_products"),
     ("inventory", "inv_shipments"),
+    ("web", "web_orders"),
+    ("edi", "edi_shipments"),
 )
 
 
@@ -95,6 +101,18 @@ def _load_inventory_prep_module():
     constants (TASK CARD 14)."""
     path = OLIST_DIR / "prepare_inventory_data.py"
     spec = importlib.util.spec_from_file_location("olist_prepare_inventory_data", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_docs_prep_module():
+    """Load ``examples/olist/prepare_docs_data.py`` by path (mirrors the
+    loaders above) to import its authored ground-truth constants
+    (TASK CARD 17)."""
+    path = OLIST_DIR / "prepare_docs_data.py"
+    spec = importlib.util.spec_from_file_location("olist_prepare_docs_data", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -158,6 +176,11 @@ def crm_prep_module():
 @pytest.fixture(scope="module")
 def inventory_prep_module():
     return _load_inventory_prep_module()
+
+
+@pytest.fixture(scope="module")
+def docs_prep_module():
+    return _load_docs_prep_module()
 
 
 @pytest.fixture(scope="module")
@@ -691,3 +714,141 @@ def test_determinism_inv_shipments(fitted_metadata):
 
     assert tables1["inv_shipments"].equals(tables2["inv_shipments"])
     assert tables1["inv_products"].equals(tables2["inv_products"])
+
+
+# --------------------------------------------------------------------------
+# 10. Document sources: web (JSON) and edi (XML) (TASK CARD 17,
+#     docs/ARCHITECTURE.md §11).
+# --------------------------------------------------------------------------
+
+
+def _document_paths(out_dir: Path) -> dict[str, Path]:
+    return {
+        "crm_tickets": out_dir / "crm" / "crm_tickets.jsonl",
+        "web_orders": out_dir / "web" / "web_orders.json",
+        "edi_shipments": out_dir / "edi" / "edi_shipments.xml",
+    }
+
+
+def test_document_files_written(synth_out_dir):
+    """Engine.generate renders the declared documents next to the per-source
+    Parquet partitions."""
+    for tname, path in _document_paths(synth_out_dir).items():
+        assert path.is_file(), path
+
+
+def test_fitted_docs_bernoulli_mirrors_are_exact(fitted_metadata):
+    """The mirror samples emit exactly one row per parent row, so fit
+    recovers bernoulli p = 1.0 for both document tables."""
+    for tname in ("web_orders", "edi_shipments"):
+        card = fitted_metadata.tables[tname].cardinality
+        assert card.kind == "bernoulli", tname
+        assert card.params["p"] == 1.0, tname
+
+
+def test_fitted_docs_categorical_fidelity(fitted_metadata, docs_prep_module):
+    checks = [
+        ("web_orders", "device", docs_prep_module.DEVICES, docs_prep_module.DEVICE_PROBS),
+        ("web_orders", "utm_source", docs_prep_module.UTM_SOURCES, docs_prep_module.UTM_SOURCE_PROBS),
+        ("edi_shipments", "service_level", docs_prep_module.SERVICE_LEVELS, docs_prep_module.SERVICE_LEVEL_PROBS),
+    ]
+    for table, column, categories, probs in checks:
+        fitted = _dist_probs(fitted_metadata, table, column)
+        for cat, authored_p in zip(categories, probs):
+            assert abs(fitted.get(cat, 0.0) - authored_p) < 0.02, (table, column, cat)
+
+
+def test_web_orders_json_agrees_with_shop_orders(synth_out_dir, synth_frames):
+    """The JSON export is schema-shaped (nested attribution object) and
+    agrees row-for-row with the relational shop source — by construction,
+    zero mismatches, not a statistical tolerance."""
+    import json as json_mod
+    from datetime import datetime
+
+    with open(_document_paths(synth_out_dir)["web_orders"]) as f:
+        records = json_mod.load(f)
+
+    orders = synth_frames["orders"]
+    assert len(records) == orders.height  # bernoulli p = 1.0 mirror
+
+    by_order = {
+        row["order_id"]: row
+        for row in orders.select(
+            ["order_id", "order_status", "order_purchase_timestamp"]
+        ).iter_rows(named=True)
+    }
+
+    web = synth_frames["web_orders"]
+    assert len(records) == web.height
+
+    for rec in records:
+        # Shape: schema-driven nesting + required leaves.
+        assert set(rec) <= {"web_order_id", "order_id", "status", "placed_at", "attribution"}
+        assert set(rec["attribution"]) == {"device", "utm_source"}
+
+        src = by_order[rec["order_id"]]
+        assert rec["status"] == src["order_status"]
+        assert datetime.fromisoformat(rec["placed_at"]) == src["order_purchase_timestamp"]
+
+
+def test_edi_shipments_xml_agrees_with_inventory(synth_out_dir, synth_frames):
+    """The XML export follows the XSD (element order, nested routing) and
+    agrees row-for-row with the inventory source."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(_document_paths(synth_out_dir)["edi_shipments"]).getroot()
+    assert root.tag == "shipments"
+
+    shipments = synth_frames["inv_shipments"]
+    assert len(root) == shipments.height  # bernoulli p = 1.0 mirror
+
+    by_shipment = {
+        row["shipment_id"]: row
+        for row in shipments.select(["shipment_id", "warehouse", "carrier"]).iter_rows(
+            named=True
+        )
+    }
+
+    for rec in root:
+        assert rec.tag == "shipment"
+        # Element order is the XSD sequence, with routing nesting the
+        # warehouse/carrier columns (edi_common.xsd RoutingType).
+        assert [child.tag for child in rec] == [
+            "edi_message_id",
+            "shipment_id",
+            "service_level",
+            "routing",
+            "dispatched_at",
+        ]
+        routing = rec.find("routing")
+        assert [child.tag for child in routing] == ["warehouse", "carrier"]
+
+        src = by_shipment[int(rec.find("shipment_id").text)]
+        assert routing.find("warehouse").text == src["warehouse"]
+        assert routing.find("carrier").text == src["carrier"]
+
+
+def test_crm_tickets_jsonl_is_flat(synth_out_dir, synth_frames):
+    """The schema-less JSONL feed is one flat object per row with every
+    column present."""
+    import json as json_mod
+
+    tickets = synth_frames["crm_tickets"]
+    with open(_document_paths(synth_out_dir)["crm_tickets"]) as f:
+        lines = [line for line in f if line.strip()]
+
+    assert len(lines) == tickets.height
+    first = json_mod.loads(lines[0])
+    assert set(first) == set(tickets.columns)
+
+
+def test_document_determinism_across_partitions(tmp_path, fitted_metadata, synth_out_dir):
+    """Documents are rendered from the Parquet partitions ordered by primary
+    key, so the files are byte-identical for any partition count (the module
+    fixture generated with 2 partitions; regenerate with 1)."""
+    single_dir = tmp_path / "single"
+    Engine(load_metadata(FITTED_PATH)).generate(str(single_dir), num_partitions=1)
+
+    for tname, path in _document_paths(synth_out_dir).items():
+        other = _document_paths(single_dir)[tname]
+        assert other.read_bytes() == path.read_bytes(), tname

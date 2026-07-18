@@ -7,6 +7,7 @@ implements.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +58,23 @@ class CopulaSpec:
 
 
 @dataclass
+class FormatSpec:
+    """Document rendering for a table (docs/ARCHITECTURE.md §11).
+
+    ``kind`` selects the file format; ``schemas`` optionally names one or
+    more JSON Schema (.json) or XSD (.xsd) files that shape the documents.
+    Relative schema paths are resolved against the metadata document's
+    directory (``Metadata.base_dir``). ``root``/``record`` name the XML
+    wrapper and per-row elements (xml only).
+    """
+
+    kind: str  # "json" | "jsonl" | "xml"
+    schemas: list[str] = field(default_factory=list)
+    root: str | None = None
+    record: str | None = None
+
+
+@dataclass
 class ColumnSpec:
     name: str
     type: str
@@ -82,6 +100,7 @@ class TableSpec:
     copulas: list[CopulaSpec] = field(default_factory=list)
     derived: list[DerivedSpec] = field(default_factory=list)
     source: str | None = None  # optional source-system name (see §6, §8)
+    format: FormatSpec | None = None  # optional document rendering (see §11)
 
 
 @dataclass
@@ -89,6 +108,9 @@ class Metadata:
     version: int
     seed: int
     tables: dict[str, TableSpec]
+    # Directory of the metadata document, set by load_metadata; relative
+    # format-schema paths resolve against it. Not part of the serialized DSL.
+    base_dir: Path | None = None
 
     def table_order(self) -> list[str]:
         """Topological order: roots first, parents before children."""
@@ -157,6 +179,12 @@ _CARD_INT_PARAMS: dict[str, set[str]] = {
     "fixed": {"n"},
 }
 
+_FORMAT_KINDS = {"json", "jsonl", "xml"}
+
+# XML element names accepted for format.root / format.record (a pragmatic
+# NCName subset: no namespaces/colons).
+_XML_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+
 
 # --------------------------------------------------------------------------
 # Loading / parsing
@@ -179,7 +207,9 @@ def load_metadata(path: str | Path) -> Metadata:
         raise MetadataError(
             f"root: unsupported metadata file extension {p.suffix!r} for {p}"
         )
-    return parse_metadata(obj)
+    md = parse_metadata(obj)
+    md.base_dir = p.resolve().parent
+    return md
 
 
 def parse_metadata(obj: dict) -> Metadata:
@@ -262,6 +292,20 @@ def _parse_copula(path: str, d: Any) -> CopulaSpec:
     return CopulaSpec(name=name, columns=columns, correlation=correlation)
 
 
+def _parse_format(path: str, d: Any) -> FormatSpec:
+    if not isinstance(d, dict) or "kind" not in d:
+        raise MetadataError(f"{path}: format spec must be a mapping with a 'kind'")
+    schemas = d.get("schemas")
+    if schemas is None and d.get("schema") is not None:
+        schemas = [d["schema"]]  # scalar shorthand for a single schema file
+    return FormatSpec(
+        kind=d.get("kind"),
+        schemas=list(schemas or []),
+        root=d.get("root"),
+        record=d.get("record"),
+    )
+
+
 def _parse_derived(path: str, d: Any) -> DerivedSpec:
     if not isinstance(d, dict):
         raise MetadataError(f"{path}: derived spec must be a mapping")
@@ -323,6 +367,10 @@ def _parse_table(tname: str, tdict: Any) -> TableSpec:
         for i, der in enumerate(tdict.get("derived") or [])
     ]
 
+    fmt = None
+    if tdict.get("format") is not None:
+        fmt = _parse_format(f"{path}.format", tdict["format"])
+
     return TableSpec(
         name=tname,
         role=tdict.get("role"),
@@ -335,6 +383,7 @@ def _parse_table(tname: str, tdict: Any) -> TableSpec:
         copulas=copulas,
         derived=derived,
         source=tdict.get("source"),
+        format=fmt,
     )
 
 
@@ -457,6 +506,34 @@ def _validate_cardinality(path: str, card: CardinalitySpec, child_stride: int | 
         raise MetadataError(
             f"{path}: effective max ({eff_max}) must be < child_stride ({child_stride})"
         )
+
+
+def _validate_format(path: str, fmt: FormatSpec) -> None:
+    if fmt.kind not in _FORMAT_KINDS:
+        raise MetadataError(
+            f"{path}.kind: must be one of {sorted(_FORMAT_KINDS)} (got {fmt.kind!r})"
+        )
+    for i, s in enumerate(fmt.schemas):
+        if not isinstance(s, str) or not s:
+            raise MetadataError(f"{path}.schemas[{i}]: must be a non-empty path string")
+        if fmt.kind == "xml":
+            if not s.lower().endswith(".xsd"):
+                raise MetadataError(
+                    f"{path}.schemas[{i}]: xml format requires .xsd schema files (got {s!r})"
+                )
+        elif not s.lower().endswith(".json"):
+            raise MetadataError(
+                f"{path}.schemas[{i}]: {fmt.kind} format requires .json JSON Schema "
+                f"files (got {s!r})"
+            )
+    if fmt.kind == "xml":
+        for fname, v in (("root", fmt.root), ("record", fmt.record)):
+            if v is not None and (not isinstance(v, str) or not _XML_NAME_RE.match(v)):
+                raise MetadataError(
+                    f"{path}.{fname}: must be a valid XML element name (got {v!r})"
+                )
+    elif fmt.root is not None or fmt.record is not None:
+        raise MetadataError(f"{path}: root/record are only valid for kind 'xml'")
 
 
 def _validate_temporal(md: Metadata, tname: str, t: TableSpec) -> None:
@@ -671,6 +748,9 @@ def validate(md: Metadata) -> None:
         if t.cardinality is not None:
             _validate_cardinality(f"{path}.cardinality", t.cardinality, t.child_stride)
 
+        if t.format is not None:
+            _validate_format(f"{path}.format", t.format)
+
         seen_copula_names: set[str] = set()
         for i, cop in enumerate(t.copulas):
             cpath = f"{path}.copulas.{cop.name}" if cop.name else f"{path}.copulas[{i}]"
@@ -741,6 +821,17 @@ def _derived_spec_to_dict(der: DerivedSpec) -> dict[str, Any]:
     return {"name": der.name, "expr": der.expr}
 
 
+def _format_spec_to_dict(fmt: FormatSpec) -> dict[str, Any]:
+    d: dict[str, Any] = {"kind": fmt.kind}
+    if fmt.schemas:
+        d["schemas"] = list(fmt.schemas)
+    if fmt.root is not None:
+        d["root"] = fmt.root
+    if fmt.record is not None:
+        d["record"] = fmt.record
+    return d
+
+
 def _column_spec_to_dict(col: ColumnSpec) -> dict[str, Any]:
     d: dict[str, Any] = {"type": col.type}
     if col.generator is not None:
@@ -768,6 +859,8 @@ def _table_spec_to_dict(t: TableSpec) -> dict[str, Any]:
     }
     if t.source is not None:
         d["source"] = t.source
+    if t.format is not None:
+        d["format"] = _format_spec_to_dict(t.format)
     if t.role == "root":
         d["rows"] = t.rows
     else:

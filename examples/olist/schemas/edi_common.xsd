@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shared EDI types, pulled into edi_shipment.xsd via xs:include to
+     exercise multi-file XSD resolution (docs/ARCHITECTURE.md §11). -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified">
+  <xs:complexType name="RoutingType">
+    <xs:sequence>
+      <xs:element name="warehouse" type="xs:string"/>
+      <xs:element name="carrier" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>

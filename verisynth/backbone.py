@@ -156,5 +156,15 @@ class ParquetBackbone:
 
 
 def validate_dataset(metadata: Metadata, out_dir: str | Path) -> list[str]:
-    """Convenience wrapper: `ParquetBackbone(out_dir).validate(metadata)`."""
-    return ParquetBackbone(out_dir).validate(metadata)
+    """`ParquetBackbone(out_dir).validate(metadata)` plus document checks.
+
+    Tables with a ``format:`` block also get their rendered JSON/XML
+    document validated (existence + record count, docs/ARCHITECTURE.md §11).
+    """
+    violations = ParquetBackbone(out_dir).validate(metadata)
+
+    # Imported here: documents.py imports ParquetBackbone from this module.
+    from .documents import validate_documents
+
+    violations.extend(validate_documents(metadata, out_dir))
+    return violations

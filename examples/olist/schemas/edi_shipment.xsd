@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- EDI shipment-notification message shape (docs/ARCHITECTURE.md §11).
+     The wrapper element `shipments` holds one `shipment` per generated
+     edi_shipments row; leaf element names match verisynth columns and the
+     nested `routing` element (RoutingType, edi_common.xsd) groups the flat
+     warehouse/carrier columns. -->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified">
+  <xs:include schemaLocation="edi_common.xsd"/>
+
+  <xs:element name="shipments">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="shipment" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="shipment">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="edi_message_id" type="xs:long"/>
+        <xs:element name="shipment_id" type="xs:long"/>
+        <xs:element name="service_level" type="xs:string"/>
+        <xs:element name="routing" type="RoutingType"/>
+        <xs:element name="dispatched_at" type="xs:dateTime" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "web_order.schema.json",
+  "title": "Web storefront order-event export",
+  "description": "One export file per dataset: an array of order events as the storefront's API would publish them. Leaf property names match verisynth columns; the nested 'attribution' object groups the flat device/utm_source columns (docs/ARCHITECTURE.md §11).",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["web_order_id", "order_id", "status", "placed_at"],
+    "properties": {
+      "web_order_id": {"type": "integer"},
+      "order_id": {"type": "integer"},
+      "status": {"type": "string"},
+      "placed_at": {"type": "string", "format": "date-time"},
+      "attribution": {"$ref": "web_common.schema.json#/definitions/attribution"}
+    }
+  }
+}

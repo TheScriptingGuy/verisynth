@@ -19,6 +19,7 @@ privacy); generation is a **pure deterministic function** of `(seed, metadata)`.
 | Temporal | `verisynth/temporal.py` | Delay propagation along event anchor DAG |
 | Transforms | `verisynth/transforms.py` | Polars derived columns (`pl.sql_expr`) |
 | Backbone | `verisynth/backbone.py` | DuckDB out-of-core Parquet write + SQL validation |
+| Documents | `verisynth/documents.py` | JSON/XML document rendering (schema-shaped or flat) + validation |
 | Engine | `verisynth/engine.py` | Orchestration: per-partition Arrow table generation |
 | Fitter | `verisynth/fit.py` | Fit metadata params from real data |
 | Privacy | `verisynth/privacy.py` | Laplace mechanism, epsilon budget split |
@@ -207,6 +208,13 @@ Rules:
   Delay units are **seconds**; sampled delays are clamped at ≥ 0.
 - `derived[].expr` is a Polars SQL expression string (`pl.sql_expr`), evaluated last;
   derived columns may reference any non-derived column.
+- Optional per-table `format: {kind, schemas?, root?, record?}` — renders the table
+  as a JSON/JSONL/XML **document file** in addition to its Parquet partitions
+  (§11). `kind` ∈ `json` | `jsonl` | `xml`; `schemas` lists zero or more JSON
+  Schema (`.json`) or XSD (`.xsd`) files that shape the documents (`schema: path`
+  is scalar shorthand); `root`/`record` name the XML wrapper and per-row elements
+  (xml only). Relative schema paths resolve against the metadata document's
+  directory.
 - Validation errors raise `MetadataError` with a message naming the offending path.
 
 ## 3. Row keys, cardinality, partition-by-root
@@ -267,6 +275,8 @@ If the anchor value is null, the result is null. Cycles → `MetadataError`.
 4. Emit `dict[str, pa.Table]`; backbone writes
    `{out}/{source}/{table}/part-{p:05d}.parquet` via DuckDB `COPY`
    (`{out}/{table}/...` when the table has no `source`).
+5. After all partitions are written, tables with a `format:` block are
+   additionally rendered as JSON/XML document files (§11).
 
 Public API:
 
@@ -420,3 +430,53 @@ Deterministic structural-inference rules (shared by chat defaults and
   matrix.
 - **Sources**: repeatable `--source NAME=PATTERN` (fnmatch, first match
   wins) assigns `source:` labels in both chat and `--yes` modes.
+
+Scanner input formats: alongside `{table}.parquet` / `{table}.csv`, the
+scanner (and therefore `scan`, `init`, and any flow built on `_load_frames`)
+accepts `{table}.json` / `.jsonl` / `.ndjson` (read via DuckDB
+`read_json_auto`; nested objects are flattened to their leaf field names,
+falling back to `{struct}_{field}` on collision) and `{table}.xml` (records
+are the children of the document root; nested elements flatten the same way;
+element text is type-inferred int → float → bool → timestamp → string).
+Flattening is the inverse of the §11 schema-shaping convention, so scanning
+a directory of shaped documents recovers the flat column model.
+
+## 11. Document synthesis (JSON / XML)
+
+Real source systems rarely exchange Parquet: they export JSON APIs and XML
+messages. A table with a `format:` block (§2) is rendered — in addition to
+its canonical Parquet partitions, which remain the substrate for SQL
+validation — as one document file per table:
+`{out}/{source}/{table}.json|.jsonl|.xml`.
+
+- Rows are read back from the Parquet partitions with DuckDB, `ORDER BY`
+  the primary key — document files are **byte-identical for any partition
+  count** (the same guarantee §3 gives the Parquet dataset).
+- **Without schemas** documents are flat: one object per row (`json` is a
+  single array — rendering delegated to DuckDB's JSON writer; `jsonl` is
+  newline-delimited) or one `<record>` element per row with one child
+  element per column (`xml`; nulls omit the element).
+- **With schemas** rows are shaped into the schema's (possibly nested)
+  structure by matching leaf property/element names to column names —
+  nested objects/elements group flat columns. `kind: json|jsonl` takes one
+  or more **JSON Schema** files: the first is the primary (its root, or its
+  `items` when the root is an array, describes one record); additional
+  files serve `$ref` targets (resolved by filename or `$id`, with JSON
+  pointers). `kind: xml` takes one or more **XSD** files: `xs:include` /
+  `xs:import` are followed transitively, named `xs:complexType`s and global
+  `xs:element`s may live in any provided file, the record element is
+  `format.record` (or discovered from a wrapper root element declared with
+  a single `maxOccurs="unbounded"` particle), and `minOccurs="0"` elements
+  are omitted when the column value is null.
+- Schema enforcement happens at **compile time**: a required schema
+  property/element with no matching column raises `DocumentError` before
+  anything is written — no external validation libraries are involved.
+- `validate` (and `validate_dataset`) additionally checks every declared
+  document: the file exists and its record count matches the Parquet
+  partitions (JSON counted via DuckDB `read_json_auto`, XML via
+  ElementTree).
+
+The master-source pattern (§8) composes with this: a `web` or `edi` source
+whose tables inherit their business columns via `generator: parent:{column}`
+yields JSON/XML exports that agree row-for-row with the relational sources
+they mirror. See `examples/olist/` (sources `web` and `edi`).
