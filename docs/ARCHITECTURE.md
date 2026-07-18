@@ -272,8 +272,11 @@ new `Metadata` with fitted parameters:
 - child cardinality → `poisson` with `lam = mean count per parent`,
   `max = ceil(observed max * 1.5)` (and `child_stride` = next power of two > max).
 - copula correlation: Spearman ρ per pair → Pearson on latents via `2·sin(πρ/6)`.
-- temporal delays: observed `event − anchor` seconds (nonneg); if all > 0 →
-  `lognormal` on logs, else `exponential` with `rate = 1/mean`.
+- temporal delays: observed `event − anchor` seconds (nonneg); if ≥ 95% of the
+  observed delays are > 0 → `lognormal` fitted on the strictly-positive subset
+  (robust to a small fraction of zero/clamped-negative delays; preserves the
+  median of heavy-tailed delay distributions), else `exponential` with
+  `rate = 1/mean` over all delays.
 
 Differential privacy (optional, `epsilon` set): the *only* things released are the
 fitted parameters, each perturbed by the Laplace mechanism with the total epsilon
