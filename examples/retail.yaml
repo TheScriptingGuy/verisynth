@@ -1,0 +1,48 @@
+version: 1
+seed: 42
+tables:
+  customers:
+    role: root
+    rows: 10000
+    primary_key: customer_id
+    columns:
+      customer_id: {type: int64, generator: key}
+      region:
+        type: string
+        distribution: {kind: categorical, categories: [NA, EU, APAC], probs: [0.5, 0.3, 0.2]}
+      age:
+        type: int64
+        distribution: {kind: normal, mean: 41.0, std: 13.0}
+        clamp: [18, 95]
+        round: true
+      income:
+        type: float64
+        distribution: {kind: lognormal, mu: 10.8, sigma: 0.6}
+      signup_at:
+        type: timestamp
+        distribution: {kind: datetime_uniform, start: "2022-01-01T00:00:00", end: "2025-12-31T23:59:59"}
+    copulas:
+      - name: profile
+        columns: [age, income]
+        correlation: [[1.0, 0.55], [0.55, 1.0]]
+  orders:
+    role: child
+    parent: customers
+    cardinality: {kind: poisson, lam: 4.2, max: 63}
+    child_stride: 64
+    primary_key: order_id
+    columns:
+      order_id:    {type: int64, generator: key}
+      customer_id: {type: int64, generator: parent_key}
+      order_total:
+        type: float64
+        distribution: {kind: lognormal, mu: 3.4, sigma: 0.8}
+        null_rate: 0.01
+      ordered_at:
+        type: timestamp
+        temporal: {anchor: customers.signup_at, delay: {kind: exponential, rate: 1.0e-6}}
+      shipped_at:
+        type: timestamp
+        temporal: {anchor: ordered_at, delay: {kind: lognormal, mu: 11.5, sigma: 0.6}}
+    derived:
+      - {name: order_total_eur, expr: "order_total * 0.92"}

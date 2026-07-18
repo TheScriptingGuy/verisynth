@@ -1,0 +1,15 @@
+[package]
+name = "verisynth-kernels"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "verisynth_kernels"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
+numpy = "0.24"
+
+[profile.release]
+lto = true
