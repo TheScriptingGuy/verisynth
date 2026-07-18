@@ -1,14 +1,14 @@
 version: 1
 seed: 20240817
 tables:
-  customers:
+  crm_contacts:
     role: root
-    primary_key: customer_id
+    primary_key: contact_id
     columns:
-      customer_id:
+      contact_id:
         type: int64
         generator: key
-      customer_state:
+      state:
         type: string
         distribution:
           kind: categorical
@@ -41,34 +41,179 @@ tables:
           - SP
           - TO
           probs:
-          - 0.0009333333333333333
-          - 0.0033333333333333335
-          - 0.0016
-          - 0.0004
-          - 0.03333333333333333
-          - 0.0142
-          - 0.0208
-          - 0.021533333333333335
-          - 0.019933333333333334
-          - 0.0074
-          - 0.1176
-          - 0.008333333333333333
-          - 0.008733333333333333
-          - 0.010066666666666666
-          - 0.004933333333333333
-          - 0.017066666666666667
-          - 0.005533333333333334
-          - 0.0518
-          - 0.12666666666666668
-          - 0.004266666666666667
+          - 0.00092
+          - 0.00324
+          - 0.00148
+          - 0.00036
+          - 0.03288
+          - 0.01452
+          - 0.01996
+          - 0.02152
+          - 0.01948
+          - 0.00772
+          - 0.11992
+          - 0.00816
+          - 0.00936
+          - 0.00968
+          - 0.00492
+          - 0.0172
+          - 0.0052
+          - 0.051
+          - 0.12812
+          - 0.004
+          - 0.0028
+          - 0.00068
+          - 0.0568
+          - 0.0354
+          - 0.00492
+          - 0.41716
           - 0.0026
-          - 0.0006
-          - 0.05726666666666667
-          - 0.036
-          - 0.004666666666666667
-          - 0.4176666666666667
-          - 0.0027333333333333333
-    rows: 15000
+      created_at:
+        type: timestamp
+        distribution:
+          kind: datetime_uniform
+          start: '2015-01-01T00:43:47'
+          end: '2018-09-30T22:56:08'
+      segment:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - consumer
+          - enterprise
+          - small_business
+          probs:
+          - 0.781
+          - 0.0702
+          - 0.1488
+      marketing_opt_in:
+        type: bool
+        distribution:
+          kind: categorical
+          categories:
+          - false
+          - true
+          probs:
+          - 0.64908
+          - 0.35092
+    source: crm
+    rows: 25000
+  crm_tickets:
+    role: child
+    primary_key: ticket_id
+    columns:
+      ticket_id:
+        type: int64
+        generator: key
+      contact_id:
+        type: int64
+        generator: parent_key
+      channel:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - chat
+          - email
+          - phone
+          - whatsapp
+          probs:
+          - 0.27006392045454547
+          - 0.3689630681818182
+          - 0.20525568181818182
+          - 0.15571732954545456
+      category:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - account
+          - delivery_issue
+          - other
+          - payment_issue
+          - product_question
+          - return_request
+          probs:
+          - 0.07821377840909091
+          - 0.30522017045454547
+          - 0.11754261363636363
+          - 0.11967329545454546
+          - 0.21946022727272727
+          - 0.15988991477272727
+      priority:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - high
+          - low
+          - medium
+          - urgent
+          probs:
+          - 0.14586292613636365
+          - 0.44868607954545453
+          - 0.3563565340909091
+          - 0.04909446022727273
+      opened_at:
+        type: timestamp
+        temporal:
+          anchor: crm_contacts.created_at
+          delay:
+            kind: lognormal
+            mu: 16.016686879489342
+            sigma: 1.0010727580608083
+      resolved_at:
+        type: timestamp
+        temporal:
+          anchor: opened_at
+          delay:
+            kind: lognormal
+            mu: 11.282438443597615
+            sigma: 1.201342657323384
+        null_rate: 0.08
+      csat_score:
+        type: int64
+        distribution:
+          kind: categorical
+          categories:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          probs:
+          - 0.07905932403687072
+          - 0.0685417159064051
+          - 0.15492791302292602
+          - 0.3012290238714252
+          - 0.39624202316237295
+        null_rate: 0.25
+    source: crm
+    parent: crm_contacts
+    cardinality:
+      kind: poisson
+      lam: 0.45056
+      max: 8
+    child_stride: 16
+  customers:
+    role: child
+    primary_key: customer_id
+    columns:
+      customer_id:
+        type: int64
+        generator: key
+      contact_id:
+        type: int64
+        generator: parent_key
+      customer_state:
+        type: string
+        generator: parent:state
+    source: shop
+    parent: crm_contacts
+    cardinality:
+      kind: bernoulli
+      p: 0.6
+    child_stride: 2
   orders:
     role: child
     primary_key: order_id
@@ -140,6 +285,7 @@ tables:
             kind: lognormal
             mu: 14.512082367781652
             sigma: 0.41224146302846254
+    source: shop
     parent: customers
     cardinality:
       kind: poisson
@@ -176,6 +322,7 @@ tables:
             kind: lognormal
             mu: 13.160587440220466
             sigma: 0.41160577377773455
+    source: shop
     parent: orders
     cardinality:
       kind: poisson
@@ -266,6 +413,7 @@ tables:
           kind: lognormal
           mu: 4.59510202227695
           sigma: 0.9481873403138368
+    source: shop
     parent: orders
     cardinality:
       kind: poisson
@@ -316,6 +464,7 @@ tables:
             kind: lognormal
             mu: 13.75871104915853
             sigma: 0.6378987954501665
+    source: shop
     parent: orders
     cardinality:
       kind: poisson

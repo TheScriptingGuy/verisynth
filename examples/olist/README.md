@@ -11,7 +11,9 @@ synthetic data in `examples/retail.yaml`.
 Files:
 
 - `prepare_data.py` -- downsamples/cleans the raw Kaggle CSVs into the
-  Parquet inputs `verisynth fit` expects.
+  Parquet inputs `verisynth fit` expects (the "shop" source).
+- `prepare_crm_data.py` -- synthesizes a second source, a CRM system, from
+  the shop sample (see "Two sources" below).
 - `skeleton.yaml` -- structural metadata (tables, keys, cardinalities,
   copula groups, temporal anchors) with placeholder distribution
   parameters, to be filled in by `verisynth fit`.
@@ -19,9 +21,12 @@ Files:
   `verisynth fit` against the committed sample. Committed as the expected
   output artifact; `tests/test_olist_integration.py` asserts that refitting
   the committed sample reproduces it.
-- `data/*.parquet` -- a committed, deterministic 15,000-customer sample
-  (see "Attribution & license" below), small enough (~2.3 MB total) to keep
-  in the repo so the integration tests always run.
+- `data/*.parquet` -- a committed, deterministic sample: 15,000 shop
+  customers (`customers.parquet`, `orders.parquet`, `order_items.parquet`,
+  `order_payments.parquet`, `order_reviews.parquet`) plus 25,000 synthesized
+  CRM contacts (`crm_contacts.parquet`, `crm_tickets.parquet`) -- see
+  "Attribution & license" below -- small enough (~3.3 MB total) to keep in
+  the repo so the integration tests always run.
 
 ## Attribution & license
 
@@ -49,6 +54,7 @@ ShareAlike terms; consult the license before any other reuse.
 | `olist_order_payments_dataset` | `order_payments` | child of `orders`; a single order can have multiple payment rows (installments/split payments). |
 | `olist_order_reviews_dataset` | `order_reviews` | child of `orders`. |
 | `olist_products_dataset`, `olist_sellers_dataset`, `olist_geolocation_dataset` | *(not modeled)* | verisynth's current metadata DSL supports a single-parent tree per table (`role: child` + one `parent`); products/sellers are shared across many orders (many-to-many via order_items) and geolocation keys off zip-code prefix, neither of which fits the tree-shaped parent/child model. Modeling them would require multi-parent / reference-table support that is out of scope for this example. |
+| *(synthesized, `prepare_crm_data.py`)* | `crm_contacts`, `crm_tickets` | a second **CRM source**, root of the whole tree; see "Two sources" below. |
 
 ## Data cleaning applied
 
@@ -69,6 +75,64 @@ ShareAlike terms; consult the license before any other reuse.
   distribution (existing, unmodified fitter behavior -- see
   `docs/ARCHITECTURE.md` §7).
 
+## Two sources: CRM as the customer master
+
+This example models **two source systems** sharing one entity tree (see
+`docs/ARCHITECTURE.md` §8, the "master-source pattern"):
+
+- **`crm` source** -- `crm_contacts` (root, 25,000 rows) is the customer
+  master: every contact's `state`, `segment`, `marketing_opt_in`, and
+  `created_at` are authoritative here. `crm_tickets` is its child (support
+  tickets, `poisson{lam: 0.45}` per contact), temporally anchored on the
+  owning contact's `created_at`.
+- **`shop` source** -- `customers` is a **child of `crm_contacts`**, not a
+  root: only a fraction of CRM contacts ever became shop customers, modeled
+  as `cardinality: bernoulli{p: 0.6}` (fit exactly as `15000 / 25000` from
+  the sample -- "a fraction `p` of master records exist downstream", per
+  §8). Its `contact_id` column is `generator: parent_key` (which CRM
+  contact this shop customer is), and critically its `customer_state`
+  column is `generator: "parent:state"` -- **inherited**, not
+  independently generated. `orders`, `order_items`, `order_payments`, and
+  `order_reviews` hang off `customers` exactly as before.
+
+Because inherited columns are *copied* from the parent's already-generated
+value rather than re-sampled, `shop.customers.customer_state` and
+`crm.crm_contacts.state` can never disagree for a linked pair -- not
+approximately, but by construction, row for row, across any number of
+partitions or workers. `tests/test_olist_integration.py::test_master_data_consistency`
+checks this with a DuckDB join over the generated output and asserts zero
+mismatches (not a statistical tolerance).
+
+The CRM source itself doesn't exist in the raw Olist data -- there is no
+real CRM to model. `prepare_crm_data.py` synthesizes it deterministically
+from the shop sample: it takes the 15,000 real customers as contacts who
+are also shop customers (`state` copied from their real `customer_state`),
+adds `--leads` (default 10,000) purely-CRM leads with states drawn from
+the real population's empirical state distribution, and generates
+`created_at`/`segment`/`marketing_opt_in`/tickets from authored
+ground-truth constants (`SEGMENTS`, `CHANNELS`, `CATEGORIES`,
+`PRIORITIES`, `CSAT_PROBS`, etc., at the top of the module) via
+`numpy.random.default_rng(seed)`. This is a round-trip fidelity demo in
+itself: `verisynth fit` refits `crm_contacts`/`crm_tickets`'s categorical
+distributions, cardinality, and temporal delays from this synthesized
+sample, and the fitted parameters land within ~0.01-0.02 of the authored
+constants (see `tests/test_olist_integration.py::test_fitted_crm_categorical_fidelity`
+and neighboring tests).
+
+Output layout after `verisynth generate` reflects the source split
+(`source:` routes output, per §6/§8 -- it doesn't change generation
+semantics):
+
+```
+{out}/crm/crm_contacts/part-00000.parquet, ...
+{out}/crm/crm_tickets/part-00000.parquet, ...
+{out}/shop/customers/part-00000.parquet, ...
+{out}/shop/orders/part-00000.parquet, ...
+{out}/shop/order_items/part-00000.parquet, ...
+{out}/shop/order_payments/part-00000.parquet, ...
+{out}/shop/order_reviews/part-00000.parquet, ...
+```
+
 ## How to regenerate from full data
 
 ```bash
@@ -78,22 +142,30 @@ ShareAlike terms; consult the license before any other reuse.
 #    olist_order_items_dataset.csv, olist_order_payments_dataset.csv,
 #    olist_order_reviews_dataset.csv
 
-# 2. Prepare the deterministic sample (or omit --sample-customers, or pass 0,
-#    to keep every customer):
+# 2. Prepare the deterministic shop sample (or omit --sample-customers, or
+#    pass 0, to keep every customer):
 python examples/olist/prepare_data.py \
     --csv-dir ./olist-raw \
     --out examples/olist/data \
     --sample-customers 15000
 
-# 3. Fit metadata parameters from the sample:
+# 3. Synthesize the CRM source from the shop sample just written:
+python examples/olist/prepare_crm_data.py \
+    --data-dir examples/olist/data \
+    --out examples/olist/data \
+    --leads 10000
+
+# 4. Fit metadata parameters from both sources (skeleton.table_order() now
+#    covers all 7 tables -- crm_contacts.parquet/crm_tickets.parquet must
+#    exist alongside the shop *.parquet files under --input):
 verisynth fit --input examples/olist/data \
     -m examples/olist/skeleton.yaml \
     -o examples/olist/metadata.olist.yaml
 
-# 4. Generate a synthetic dataset:
+# 5. Generate a synthetic dataset:
 verisynth generate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth --partitions 2
 
-# 5. Validate it:
+# 6. Validate it:
 verisynth validate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth
 ```
 

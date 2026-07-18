@@ -1,18 +1,78 @@
 version: 1
 seed: 20240817
 tables:
-  customers:
+  # --- CRM source: the customer master. See docs/ARCHITECTURE.md §8 and
+  # prepare_crm_data.py (which synthesizes examples/olist/data/crm_*.parquet
+  # from the shop's real customer sample). ---
+  crm_contacts:
     role: root
-    rows: 15000
+    rows: 25000
+    source: crm
+    primary_key: contact_id
+    columns:
+      contact_id: {type: int64, generator: key}
+      state:
+        type: string
+        distribution: {kind: categorical, categories: [SP, RJ, MG], probs: [0.5, 0.3, 0.2]}
+      created_at:
+        type: timestamp
+        distribution: {kind: datetime_uniform, start: "2015-01-01T00:00:00", end: "2018-10-01T00:00:00"}
+      segment:
+        type: string
+        distribution: {kind: categorical, categories: [consumer, small_business], probs: [0.8, 0.2]}
+      marketing_opt_in:
+        type: bool
+        distribution: {kind: categorical, categories: [true, false], probs: [0.35, 0.65]}
+  crm_tickets:
+    role: child
+    parent: crm_contacts
+    source: crm
+    cardinality: {kind: poisson, lam: 0.45, max: 8}
+    child_stride: 16
+    primary_key: ticket_id
+    columns:
+      ticket_id: {type: int64, generator: key}
+      contact_id: {type: int64, generator: parent_key}
+      channel:
+        type: string
+        distribution: {kind: categorical, categories: [email, chat, phone, whatsapp], probs: [0.25, 0.25, 0.25, 0.25]}
+      category:
+        type: string
+        distribution: {kind: categorical, categories: [delivery_issue, product_question], probs: [0.5, 0.5]}
+      priority:
+        type: string
+        distribution: {kind: categorical, categories: [low, medium], probs: [0.5, 0.5]}
+      opened_at:
+        type: timestamp
+        temporal: {anchor: crm_contacts.created_at, delay: {kind: lognormal, mu: 16.0, sigma: 1.0}}
+      resolved_at:
+        type: timestamp
+        temporal: {anchor: opened_at, delay: {kind: lognormal, mu: 11.3, sigma: 1.2}}
+        null_rate: 0.08
+      csat_score:
+        type: int64
+        distribution: {kind: categorical, categories: [1, 2, 3, 4, 5], probs: [0.2, 0.2, 0.2, 0.2, 0.2]}
+        null_rate: 0.25
+  # --- Shop source: order pipeline. `customers` is a child of crm_contacts
+  # (master-source pattern): only a fraction of CRM contacts have a shop
+  # account (bernoulli cardinality), and shop-side customer_state is
+  # *inherited* from the CRM record (generator: parent:state) rather than
+  # independently generated, so the two sources can never disagree. ---
+  customers:
+    role: child
+    parent: crm_contacts
+    source: shop
+    cardinality: {kind: bernoulli, p: 0.6}
+    child_stride: 2
     primary_key: customer_id
     columns:
       customer_id: {type: int64, generator: key}
-      customer_state:
-        type: string
-        distribution: {kind: categorical, categories: [SP, RJ, MG], probs: [0.5, 0.3, 0.2]}
+      contact_id: {type: int64, generator: parent_key}
+      customer_state: {type: string, generator: "parent:state"}
   orders:
     role: child
     parent: customers
+    source: shop
     cardinality: {kind: poisson, lam: 1.0, max: 20}
     child_stride: 32
     primary_key: order_id
@@ -43,6 +103,7 @@ tables:
   order_items:
     role: child
     parent: orders
+    source: shop
     cardinality: {kind: poisson, lam: 1.14, max: 25}
     child_stride: 32
     primary_key: order_item_id
@@ -65,6 +126,7 @@ tables:
   order_payments:
     role: child
     parent: orders
+    source: shop
     cardinality: {kind: poisson, lam: 1.05, max: 30}
     child_stride: 32
     primary_key: payment_id
@@ -87,6 +149,7 @@ tables:
   order_reviews:
     role: child
     parent: orders
+    source: shop
     cardinality: {kind: poisson, lam: 1.0, max: 5}
     child_stride: 8
     primary_key: review_id

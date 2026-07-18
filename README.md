@@ -20,6 +20,11 @@ byte-identical regardless of partition count.
 - **Gaussian copulas** preserve cross-column correlation; **temporal delay
   propagation** keeps event sequences (e.g. signup → order → shipment) ordered
   and realistically distributed.
+- **Multi-source datasets**: tables can be grouped into named source systems
+  (`source: crm`, `source: shop`) with a master source owning shared entities —
+  downstream tables inherit master attributes via `generator: parent:{column}`,
+  so the generated sources agree row-for-row by construction. See
+  `examples/olist/` for a two-source CRM + shop example.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design, including
 the normative hash-chain and metadata DSL specs.

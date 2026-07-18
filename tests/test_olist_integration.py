@@ -1,25 +1,31 @@
-"""Integration tests for the Olist example (TASK CARD 9).
+"""Integration tests for the Olist example (TASK CARD 9, extended by
+TASK CARD 12 for the two-source CRM/shop dataset).
 
 Exercises the committed `examples/olist` sample end-to-end: skeleton/fitted
 metadata loading, fit reproducibility against the committed
 `metadata.olist.yaml` "expected output" artifact, generation + validation,
-statistical fidelity vs. the committed source sample, and determinism.
+statistical fidelity vs. the committed source sample, cross-source
+master-data consistency (CRM as customer master), and determinism.
 
 The committed Parquet sample under `examples/olist/data/` is small (15k
-customers) and always present, so these tests always run (no skip marker).
+shop customers, 25k CRM contacts) and always present, so these tests always
+run (no skip marker).
 """
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pytest
 import yaml
 from scipy import stats
 
-from verisynth.backbone import validate_dataset
+from verisynth.backbone import ParquetBackbone, validate_dataset
 from verisynth.engine import Engine
 from verisynth.fit import fit_metadata
 from verisynth.metadata import load_metadata, metadata_to_dict
@@ -29,17 +35,51 @@ SKELETON_PATH = OLIST_DIR / "skeleton.yaml"
 FITTED_PATH = OLIST_DIR / "metadata.olist.yaml"
 DATA_DIR = OLIST_DIR / "data"
 
-TABLE_NAMES = ("customers", "orders", "order_items", "order_payments", "order_reviews")
+# All 7 tables across both source systems (crm: crm_contacts, crm_tickets;
+# shop: customers, orders, order_items, order_payments, order_reviews).
+TABLE_NAMES = (
+    "crm_contacts",
+    "crm_tickets",
+    "customers",
+    "orders",
+    "order_items",
+    "order_payments",
+    "order_reviews",
+)
+
+SOURCE_TABLES = (
+    ("crm", "crm_contacts"),
+    ("crm", "crm_tickets"),
+    ("shop", "customers"),
+    ("shop", "orders"),
+    ("shop", "order_items"),
+    ("shop", "order_payments"),
+    ("shop", "order_reviews"),
+)
 
 
 def _load_source_frames() -> dict[str, pl.DataFrame]:
     return {tname: pl.read_parquet(DATA_DIR / f"{tname}.parquet") for tname in TABLE_NAMES}
 
 
-def _load_synth_frames(out_dir: Path) -> dict[str, pl.DataFrame]:
-    return {
-        tname: pl.read_parquet(str(out_dir / tname / "*.parquet")) for tname in TABLE_NAMES
-    }
+def _load_synth_frames(out_dir: Path, metadata) -> dict[str, pl.DataFrame]:
+    backbone = ParquetBackbone(out_dir)
+    frames = {}
+    for tname in TABLE_NAMES:
+        glob = backbone.table_glob(tname, metadata.tables[tname].source)
+        frames[tname] = pl.read_parquet(glob)
+    return frames
+
+
+def _load_crm_prep_module():
+    """Load ``examples/olist/prepare_crm_data.py`` by path (``examples/``
+    is not a package) to import its authored ground-truth constants."""
+    path = OLIST_DIR / "prepare_crm_data.py"
+    spec = importlib.util.spec_from_file_location("olist_prepare_crm_data", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 # --------------------------------------------------------------------------
@@ -64,6 +104,18 @@ def _assert_close(a, b, path: str = "$", rel: float = 1e-6, abs_tol: float = 1e-
         assert a == b, f"{path}: {a!r} != {b!r}"
 
 
+def _freq(series: pl.Series) -> dict:
+    counts = series.value_counts()
+    col = series.name
+    total = counts["count"].sum()
+    return dict(zip(counts[col].to_list(), (counts["count"] / total).to_list()))
+
+
+def _dist_probs(metadata, table: str, column: str) -> dict:
+    dist = metadata.tables[table].columns[column].distribution
+    return dict(zip(dist.params["categories"], dist.params["probs"]))
+
+
 # --------------------------------------------------------------------------
 # Fixtures: fit + generate the committed sample once for the whole module.
 # --------------------------------------------------------------------------
@@ -80,6 +132,11 @@ def fitted_metadata():
 
 
 @pytest.fixture(scope="module")
+def crm_prep_module():
+    return _load_crm_prep_module()
+
+
+@pytest.fixture(scope="module")
 def synth_out_dir(tmp_path_factory, fitted_metadata) -> Path:
     out_dir = tmp_path_factory.mktemp("olist_gen")
     engine = Engine(fitted_metadata)
@@ -88,8 +145,8 @@ def synth_out_dir(tmp_path_factory, fitted_metadata) -> Path:
 
 
 @pytest.fixture(scope="module")
-def synth_frames(synth_out_dir) -> dict[str, pl.DataFrame]:
-    return _load_synth_frames(synth_out_dir)
+def synth_frames(synth_out_dir, fitted_metadata) -> dict[str, pl.DataFrame]:
+    return _load_synth_frames(synth_out_dir, fitted_metadata)
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +166,20 @@ def test_skeleton_and_fitted_metadata_load(fitted_metadata):
     assert [int(c) for c in review_dist.params["categories"]] == [1, 2, 3, 4, 5]
     assert sum(review_dist.params["probs"]) == pytest.approx(1.0, abs=1e-6)
 
+    # Source routing (TASK CARD 12 / docs/ARCHITECTURE.md §8): CRM tables
+    # are the customer master, shop tables are downstream.
+    assert skeleton.tables["crm_contacts"].source == "crm"
+    assert skeleton.tables["crm_tickets"].source == "crm"
+    for tname in ("customers", "orders", "order_items", "order_payments", "order_reviews"):
+        assert skeleton.tables[tname].source == "shop"
+
+    # customers is now a bernoulli child of crm_contacts, inheriting state.
+    customers_t = skeleton.tables["customers"]
+    assert customers_t.role == "child"
+    assert customers_t.parent == "crm_contacts"
+    assert customers_t.cardinality.kind == "bernoulli"
+    assert customers_t.columns["customer_state"].generator == "parent:state"
+
 
 def test_fit_produces_plain_int_categories_for_int64_categorical_columns(source_frames):
     """Direct check of the fit.py contract extension (TASK CARD 9 §1): the
@@ -126,6 +197,11 @@ def test_fit_produces_plain_int_categories_for_int64_categorical_columns(source_
     assert installments_dist.kind == "categorical"
     assert all(isinstance(c, int) for c in installments_dist.params["categories"])
     assert installments_dist.params["categories"] == sorted(installments_dist.params["categories"])
+
+    csat_dist = fitted.tables["crm_tickets"].columns["csat_score"].distribution
+    assert csat_dist.kind == "categorical"
+    assert csat_dist.params["categories"] == [1, 2, 3, 4, 5]
+    assert all(isinstance(c, int) for c in csat_dist.params["categories"])
 
 
 # --------------------------------------------------------------------------
@@ -156,16 +232,19 @@ def test_generate_and_validate(fitted_metadata, synth_out_dir):
     assert violations == []
 
 
+def test_two_source_output_layout(synth_out_dir):
+    """TASK CARD 12 §5.2: per-source output directories exist with parquet
+    parts for every table."""
+    for source, table in SOURCE_TABLES:
+        table_dir = synth_out_dir / source / table
+        assert table_dir.is_dir(), table_dir
+        parts = sorted(table_dir.glob("part-*.parquet"))
+        assert len(parts) == 2, f"{table_dir}: expected 2 partitions, found {len(parts)}"
+
+
 # --------------------------------------------------------------------------
 # 4. Statistical fidelity vs. the committed source sample.
 # --------------------------------------------------------------------------
-
-
-def _freq(series: pl.Series) -> dict:
-    counts = series.value_counts()
-    col = series.name
-    total = counts["count"].sum()
-    return dict(zip(counts[col].to_list(), (counts["count"] / total).to_list()))
 
 
 def test_customer_state_frequencies(source_frames, synth_frames):
@@ -267,7 +346,120 @@ def test_temporal_ordering(synth_frames):
 
 
 # --------------------------------------------------------------------------
-# 5. Determinism.
+# 5. Fitted CRM fidelity vs. authored ground-truth constants
+#    (TASK CARD 12 §5.1).
+# --------------------------------------------------------------------------
+
+
+def test_fitted_crm_categorical_fidelity(fitted_metadata, crm_prep_module):
+    checks = [
+        ("crm_contacts", "segment", crm_prep_module.SEGMENTS, crm_prep_module.SEGMENT_PROBS),
+        ("crm_tickets", "channel", crm_prep_module.CHANNELS, crm_prep_module.CHANNEL_PROBS),
+        ("crm_tickets", "category", crm_prep_module.CATEGORIES, crm_prep_module.CATEGORY_PROBS),
+        ("crm_tickets", "priority", crm_prep_module.PRIORITIES, crm_prep_module.PRIORITY_PROBS),
+        ("crm_tickets", "csat_score", crm_prep_module.CSAT_SCORES, crm_prep_module.CSAT_PROBS),
+    ]
+    for table, column, categories, probs in checks:
+        fitted = _dist_probs(fitted_metadata, table, column)
+        for cat, authored_p in zip(categories, probs):
+            assert abs(fitted.get(cat, 0.0) - authored_p) < 0.02, (table, column, cat)
+
+
+def test_fitted_bernoulli_p_matches_authored_leads_ratio(fitted_metadata):
+    # 15,000 real shop customers / 25,000 total CRM contacts = 0.6 exactly.
+    card = fitted_metadata.tables["customers"].cardinality
+    assert card.kind == "bernoulli"
+    assert abs(card.params["p"] - 0.6) < 0.005
+
+
+def test_fitted_crm_state_matches_shop_master(fitted_metadata, source_frames):
+    """Master fidelity: crm_contacts.state is fit from 15k real + leads
+    drawn from the real empirical distribution, so it should track the real
+    shop sample's customer_state distribution closely."""
+    fitted = _dist_probs(fitted_metadata, "crm_contacts", "state")
+    src_freq = _freq(source_frames["customers"]["customer_state"])
+    for state, p in src_freq.items():
+        assert abs(fitted.get(state, 0.0) - p) < 0.02, state
+
+
+# --------------------------------------------------------------------------
+# 6. Master-data consistency: the core cross-source assertion
+#    (TASK CARD 12 §5.3).
+# --------------------------------------------------------------------------
+
+
+def test_master_data_consistency(fitted_metadata, synth_out_dir):
+    backbone = ParquetBackbone(synth_out_dir)
+    cust_glob = backbone.table_glob("customers", fitted_metadata.tables["customers"].source)
+    contacts_glob = backbone.table_glob("crm_contacts", fitted_metadata.tables["crm_contacts"].source)
+    orders_glob = backbone.table_glob("orders", fitted_metadata.tables["orders"].source)
+
+    con = duckdb.connect()
+    try:
+        # customer_state must equal the owning CRM contact's state for
+        # EVERY shop customer: zero exceptions, by construction
+        # (generator: parent:state), not statistically.
+        (mismatches,) = con.execute(
+            f"""
+            SELECT count(*) FROM read_parquet('{cust_glob}') c
+            JOIN read_parquet('{contacts_glob}') p ON c.contact_id = p.contact_id
+            WHERE c.customer_state != p.state
+            """
+        ).fetchone()
+        assert mismatches == 0
+
+        # Every orders.customer_id exists among shop customers (already
+        # covered by validate_dataset -- kept explicit here too).
+        (orphans,) = con.execute(
+            f"""
+            SELECT count(*) FROM read_parquet('{orders_glob}') o
+            LEFT JOIN read_parquet('{cust_glob}') c ON o.customer_id = c.customer_id
+            WHERE c.customer_id IS NULL
+            """
+        ).fetchone()
+        assert orphans == 0
+
+        (n_contacts,) = con.execute(f"SELECT count(*) FROM read_parquet('{contacts_glob}')").fetchone()
+        (n_customers,) = con.execute(f"SELECT count(*) FROM read_parquet('{cust_glob}')").fetchone()
+    finally:
+        con.close()
+
+    p_fitted = fitted_metadata.tables["customers"].cardinality.params["p"]
+    assert abs(n_customers / n_contacts - p_fitted) < 0.02
+
+
+# --------------------------------------------------------------------------
+# 7. CRM temporal ordering + null structure (TASK CARD 12 §5.4).
+# --------------------------------------------------------------------------
+
+
+def test_crm_temporal_ordering_and_null_structure(synth_frames, crm_prep_module):
+    contacts = synth_frames["crm_contacts"]
+    tickets = synth_frames["crm_tickets"]
+
+    joined = tickets.join(
+        contacts.select(["contact_id", pl.col("created_at").alias("contact_created_at")]),
+        on="contact_id",
+        how="left",
+    )
+    assert (joined["opened_at"] >= joined["contact_created_at"]).all()
+
+    resolved_valid = tickets.select(["opened_at", "resolved_at"]).drop_nulls()
+    assert (resolved_valid["resolved_at"] >= resolved_valid["opened_at"]).all()
+
+    resolved_null_frac = tickets["resolved_at"].is_null().mean()
+    assert abs(resolved_null_frac - crm_prep_module.RESOLVED_NULL_RATE) < 0.02
+
+    csat_null_frac = tickets["csat_score"].is_null().mean()
+    assert abs(csat_null_frac - crm_prep_module.CSAT_NULL_RATE) < 0.02
+
+    csat_freq = _freq(tickets["csat_score"].drop_nulls())
+    for score, p in zip(crm_prep_module.CSAT_SCORES, crm_prep_module.CSAT_PROBS):
+        assert abs(csat_freq.get(score, 0.0) - p) < 0.03
+
+
+# --------------------------------------------------------------------------
+# 8. Determinism (TASK CARD 12 §5.5).
 # --------------------------------------------------------------------------
 
 
@@ -281,3 +473,20 @@ def test_determinism(fitted_metadata):
     assert set(tables1) == set(tables2)
     for tname in tables1:
         assert tables1[tname].equals(tables2[tname]), tname
+
+
+def test_determinism_across_sources_and_partitions(fitted_metadata):
+    engine1 = Engine(load_metadata(FITTED_PATH))
+    engine2 = Engine(load_metadata(FITTED_PATH))
+    single = engine1.generate_partition(0, 1)
+    single2 = engine2.generate_partition(0, 1)
+
+    assert single["crm_contacts"].equals(single2["crm_contacts"])
+    assert single["customers"].equals(single2["customers"])
+
+    # Inherited-state guarantee holds per-partition: P=1 equals the
+    # concatenation of P=3 (docs/ARCHITECTURE.md §3).
+    engine3 = Engine(load_metadata(FITTED_PATH))
+    parts = [engine3.generate_partition(p, 3) for p in range(3)]
+    concatenated = pa.concat_tables([parts[p]["customers"] for p in range(3)])
+    assert concatenated.equals(single["customers"])
