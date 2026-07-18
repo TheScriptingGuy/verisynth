@@ -72,7 +72,7 @@ def fit_metadata(
         for cname, col in t.columns.items():
             if col.distribution is None:
                 continue
-            dist, meta = _fit_marginal(df[cname])
+            dist, meta = _fit_marginal(df[cname], col.distribution.kind)
             col.distribution = dist
             if epsilon is not None:
                 entry = _marginal_dp_entry(tname, cname, col, dist, meta)
@@ -181,10 +181,17 @@ def _fit_categorical(s: pl.Series) -> tuple[DistributionSpec, dict[str, Any]]:
     return dist, {"kind": "categorical", "counts": counts}
 
 
-def _fit_marginal(series: pl.Series) -> tuple[DistributionSpec, dict[str, Any]]:
+def _fit_marginal(
+    series: pl.Series, declared_kind: str | None = None
+) -> tuple[DistributionSpec, dict[str, Any]]:
     dtype = series.dtype
     s = series.drop_nulls()
 
+    # If the skeleton declares this column categorical, honor that regardless
+    # of dtype (e.g. int64 Likert/enum-style columns). See
+    # docs/ARCHITECTURE.md §7 and TASK CARD 9 §1.
+    if declared_kind == "categorical":
+        return _fit_categorical(s)
     if dtype.is_temporal():
         return _fit_datetime(s), {"kind": "datetime"}
     if dtype.is_numeric():

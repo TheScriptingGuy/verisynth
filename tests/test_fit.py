@@ -274,3 +274,47 @@ def test_fit_never_mutates_skeleton(frames_and_extras):
 
     fit_metadata(frames, skeleton_dp, epsilon=0.5, dp_seed=3)
     assert skeleton_dp == dp_snapshot
+
+
+# --------------------------------------------------------------------------
+# 6. Declared-categorical int64 columns fit as categorical (TASK CARD 9 §1)
+# --------------------------------------------------------------------------
+
+
+def test_fit_int_dtype_column_declared_categorical_stays_categorical():
+    skeleton = parse_metadata(
+        {
+            "version": 1,
+            "seed": 1,
+            "tables": {
+                "t": {
+                    "role": "root",
+                    "rows": 5,
+                    "primary_key": "id",
+                    "columns": {
+                        "id": {"type": "int64", "generator": "key"},
+                        "score": {
+                            "type": "int64",
+                            "distribution": {
+                                "kind": "categorical",
+                                "categories": [1, 2, 3, 4, 5],
+                                "probs": [0.2, 0.2, 0.2, 0.2, 0.2],
+                            },
+                        },
+                    },
+                }
+            },
+        }
+    )
+    df = pl.DataFrame({"id": [0, 1, 2, 3, 4], "score": pl.Series([1, 1, 2, 3, 5], dtype=pl.Int64)})
+
+    fitted = fit_metadata({"t": df}, skeleton)
+
+    dist = fitted.tables["t"].columns["score"].distribution
+    assert dist.kind == "categorical"
+    assert dist.params["categories"] == [1, 2, 3, 5]
+    assert all(isinstance(c, int) for c in dist.params["categories"])
+
+    expected = {1: 0.4, 2: 0.2, 3: 0.2, 5: 0.2}
+    for cat, p in zip(dist.params["categories"], dist.params["probs"]):
+        assert abs(p - expected[cat]) < 1e-9

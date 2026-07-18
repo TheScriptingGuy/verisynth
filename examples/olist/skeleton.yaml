@@ -1,0 +1,101 @@
+version: 1
+seed: 20240817
+tables:
+  customers:
+    role: root
+    rows: 15000
+    primary_key: customer_id
+    columns:
+      customer_id: {type: int64, generator: key}
+      customer_state:
+        type: string
+        distribution: {kind: categorical, categories: [SP, RJ, MG], probs: [0.5, 0.3, 0.2]}
+  orders:
+    role: child
+    parent: customers
+    cardinality: {kind: poisson, lam: 1.0, max: 20}
+    child_stride: 32
+    primary_key: order_id
+    columns:
+      order_id:    {type: int64, generator: key}
+      customer_id: {type: int64, generator: parent_key}
+      order_status:
+        type: string
+        distribution: {kind: categorical, categories: [delivered, shipped], probs: [0.9, 0.1]}
+      order_purchase_timestamp:
+        type: timestamp
+        distribution: {kind: datetime_uniform, start: "2016-09-04T00:00:00", end: "2018-10-18T00:00:00"}
+      order_approved_at:
+        type: timestamp
+        temporal: {anchor: order_purchase_timestamp, delay: {kind: exponential, rate: 1.0e-4}}
+        null_rate: 0.0016
+      order_delivered_carrier_date:
+        type: timestamp
+        temporal: {anchor: order_approved_at, delay: {kind: lognormal, mu: 11.0, sigma: 1.0}}
+        null_rate: 0.0179
+      order_delivered_customer_date:
+        type: timestamp
+        temporal: {anchor: order_delivered_carrier_date, delay: {kind: lognormal, mu: 12.0, sigma: 1.0}}
+        null_rate: 0.0298
+      order_estimated_delivery_date:
+        type: timestamp
+        temporal: {anchor: order_purchase_timestamp, delay: {kind: lognormal, mu: 14.0, sigma: 0.5}}
+  order_items:
+    role: child
+    parent: orders
+    cardinality: {kind: poisson, lam: 1.14, max: 25}
+    child_stride: 32
+    primary_key: order_item_id
+    columns:
+      order_item_id: {type: int64, generator: key}
+      order_id:      {type: int64, generator: parent_key}
+      price:
+        type: float64
+        distribution: {kind: lognormal, mu: 4.3, sigma: 1.0}
+      freight_value:
+        type: float64
+        distribution: {kind: lognormal, mu: 2.8, sigma: 0.6}
+      shipping_limit_date:
+        type: timestamp
+        temporal: {anchor: orders.order_purchase_timestamp, delay: {kind: lognormal, mu: 12.5, sigma: 0.7}}
+    copulas:
+      - name: basket
+        columns: [price, freight_value]
+        correlation: [[1.0, 0.0], [0.0, 1.0]]
+  order_payments:
+    role: child
+    parent: orders
+    cardinality: {kind: poisson, lam: 1.05, max: 30}
+    child_stride: 32
+    primary_key: payment_id
+    columns:
+      payment_id: {type: int64, generator: key}
+      order_id:   {type: int64, generator: parent_key}
+      payment_type:
+        type: string
+        distribution: {kind: categorical, categories: [credit_card, boleto], probs: [0.8, 0.2]}
+      payment_installments:
+        type: int64
+        distribution: {kind: categorical, categories: [1, 2, 3], probs: [0.6, 0.2, 0.2]}
+      payment_value:
+        type: float64
+        distribution: {kind: lognormal, mu: 4.6, sigma: 0.9}
+    copulas:
+      - name: payment
+        columns: [payment_installments, payment_value]
+        correlation: [[1.0, 0.0], [0.0, 1.0]]
+  order_reviews:
+    role: child
+    parent: orders
+    cardinality: {kind: poisson, lam: 1.0, max: 5}
+    child_stride: 8
+    primary_key: review_id
+    columns:
+      review_id: {type: int64, generator: key}
+      order_id:  {type: int64, generator: parent_key}
+      review_score:
+        type: int64
+        distribution: {kind: categorical, categories: [1, 2, 3, 4, 5], probs: [0.2, 0.2, 0.2, 0.2, 0.2]}
+      review_creation_date:
+        type: timestamp
+        temporal: {anchor: orders.order_purchase_timestamp, delay: {kind: lognormal, mu: 13.0, sigma: 0.8}}
