@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -12,8 +13,11 @@ import yaml
 
 from .backbone import ParquetBackbone, validate_dataset
 from .engine import Engine
+from .explain import explain_metadata
 from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
+from .scanner import init_from_dir, render_report, report_to_dict, scan_directory
+from .wizard import Chat, WizardAborted, run_wizard
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
@@ -67,6 +71,87 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        report = scan_directory(args.input)
+    except FileNotFoundError as e:
+        print(e, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(report_to_dict(report), indent=2, default=str))
+    else:
+        print(render_report(report))
+    return 0
+
+
+def _cmd_explain(args: argparse.Namespace) -> int:
+    metadata = load_metadata(args.metadata)
+    doc = explain_metadata(metadata)
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            f.write(doc)
+        print(f"wrote {out_path}")
+    else:
+        print(doc)
+    return 0
+
+
+def _parse_sources(raw: list[str] | None) -> list[tuple[str, str]] | None:
+    if not raw:
+        return None
+    out = []
+    for item in raw:
+        if "=" not in item:
+            raise ValueError(f"--source must be NAME=PATTERN (got {item!r})")
+        name, pattern = item.split("=", 1)
+        out.append((name, pattern))
+    return out
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    try:
+        sources = _parse_sources(args.source)
+    except ValueError as e:
+        print(f"init: {e}", file=sys.stderr)
+        return 1
+
+    if args.yes:
+        # Non-interactive path: deterministic structural inference (TASK
+        # CARD 16) over real data -- no chat, no defaults to accept.
+        if not args.input:
+            print("init: --yes requires --input <data dir>", file=sys.stderr)
+            return 1
+        seed = args.seed if args.seed is not None else 42
+        try:
+            warnings = init_from_dir(args.input, args.out, seed=seed, sources=sources)
+        except FileNotFoundError as e:
+            print(f"init: {e}", file=sys.stderr)
+            return 1
+        md = load_metadata(args.out)
+        for tname in sorted(md.tables):
+            t = md.tables[tname]
+            wcount = sum(1 for w in warnings if tname in w)
+            print(
+                f"{tname}: role={t.role} parent={t.parent} pk={t.primary_key} "
+                f"columns={len(t.columns)} warnings={wcount}"
+            )
+        for w in warnings:
+            print(f"warning: {w}")
+        return 0
+
+    chat = Chat(assume_yes=args.yes)
+    try:
+        return run_wizard(args.out, input_dir=args.input, seed=args.seed, chat=chat, sources=sources)
+    except (WizardAborted, FileNotFoundError) as e:
+        print(f"init: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninit: cancelled", file=sys.stderr)
+        return 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="verisynth")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -90,6 +175,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fit.add_argument("--epsilon", type=float, default=None)
     p_fit.add_argument("--dp-seed", type=int, default=0)
     p_fit.set_defaults(func=_cmd_fit)
+
+    p_scan = sub.add_parser(
+        "scan", help="scan real data files and report detected keys, relations, cardinality"
+    )
+    p_scan.add_argument("--input", required=True, help="dir with {table}.parquet/.csv files")
+    p_scan.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p_scan.set_defaults(func=_cmd_scan)
+
+    p_init = sub.add_parser(
+        "init", help="build a metadata skeleton through an interactive chat"
+    )
+    p_init.add_argument("-o", "--out", required=True, help="path for the skeleton YAML")
+    p_init.add_argument(
+        "--input", default=None, help="optional data dir to scan for suggested answers"
+    )
+    p_init.add_argument("--seed", type=int, default=None)
+    p_init.add_argument(
+        "-y", "--yes", action="store_true", help="accept every suggestion (non-interactive)"
+    )
+    p_init.add_argument(
+        "--source",
+        action="append",
+        default=None,
+        metavar="NAME=PATTERN",
+        help="assign table source by fnmatch pattern (repeatable, first match wins)",
+    )
+    p_init.set_defaults(func=_cmd_init)
+
+    p_explain = sub.add_parser(
+        "explain",
+        help="render a metadata document as a plain-language Markdown explanation",
+    )
+    p_explain.add_argument("-m", "--metadata", required=True)
+    p_explain.add_argument(
+        "-o", "--out", default=None, help="write to this .md file instead of stdout"
+    )
+    p_explain.set_defaults(func=_cmd_explain)
 
     return parser
 

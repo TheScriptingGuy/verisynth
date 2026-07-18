@@ -20,6 +20,10 @@ byte-identical regardless of partition count.
 - **Gaussian copulas** preserve cross-column correlation; **temporal delay
   propagation** keeps event sequences (e.g. signup → order → shipment) ordered
   and realistically distributed.
+- **`verisynth explain`** renders any metadata document as a plain-language
+  Markdown explanation (structure, distributions, correlations, temporal
+  chains, cross-source relationships, privacy posture) for readers who don't
+  read the DSL. See `examples/olist/EXPLAIN.md` for a generated example.
 - **Multi-source datasets**: tables can be grouped into named source systems
   (`source: crm`, `source: shop`) with a master source owning shared entities —
   downstream tables inherit master attributes via `generator: parent:{column}`,
@@ -42,11 +46,24 @@ pip install dist/verisynth_kernels-*.whl
 ## Usage
 
 ```bash
+# scan real data files: detect PKs, FK relations, and cardinality profiles
+verisynth scan --input real/
+
+# build a metadata skeleton through an interactive chat -- point it at real
+# data and every question comes pre-answered by the scanner (--yes runs the
+# same structural inference non-interactively: PKs, parents/references,
+# cardinality, temporal anchors, copula proposals -- see docs/ARCHITECTURE.md
+# §2, §3, §7); --source NAME=PATTERN (repeatable) assigns table sources
+verisynth init --input real/ -o skeleton.yaml --yes
+
 # generate a dataset from metadata (see examples/retail.yaml)
 verisynth generate -m examples/retail.yaml -o out/ --partitions 4 --seed 42
 
 # check PK/FK integrity, row counts, and temporal ordering of the output
 verisynth validate -m examples/retail.yaml -o out/
+
+# render a metadata document as a plain-language Markdown explanation
+verisynth explain -m examples/retail.yaml -o explain.md
 
 # fit metadata parameters from real data (one {table}.parquet per table),
 # optionally with differential privacy on the released parameters

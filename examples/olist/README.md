@@ -25,6 +25,9 @@ Files:
   `verisynth fit` against the committed sample. Committed as the expected
   output artifact; `tests/test_olist_integration.py` asserts that refitting
   the committed sample reproduces it.
+- `EXPLAIN.md` -- plain-language Markdown rendering of `metadata.olist.yaml`,
+  produced by `verisynth explain` (see "Explaining the metadata in plain
+  language" below).
 - `data/*.parquet` -- a committed, deterministic sample: 15,000 shop
   customers (`customers.parquet`, `orders.parquet`, `order_items.parquet`
   -- now including a real `product_id` column --, `order_payments.parquet`,
@@ -258,6 +261,20 @@ verisynth generate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth --p
 # 7. Validate it:
 verisynth validate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth
 ```
+
+## Explaining the metadata in plain language
+
+`verisynth explain` renders any metadata document as human-readable Markdown
+(structure, distributions, correlations, temporal chains, cross-source
+relationships, privacy posture) -- useful for reviewers who don't read the
+DSL:
+
+```bash
+verisynth explain -m examples/olist/metadata.olist.yaml -o examples/olist/EXPLAIN.md
+```
+
+The committed `examples/olist/EXPLAIN.md` is that command's output for this
+example's fitted metadata.
 
 ## What is preserved
 

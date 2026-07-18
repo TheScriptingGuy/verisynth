@@ -358,6 +358,65 @@ and a shop database) as one entity tree. The pattern:
 verisynth generate -m metadata.yaml -o out/ [--partitions K] [--seed S]
 verisynth validate -m metadata.yaml -o out/
 verisynth fit --input <dir with {table}.parquet> -m skeleton.yaml -o fitted.yaml [--epsilon E] [--dp-seed S]
+verisynth scan --input <dir with {table}.parquet/.csv> [--json]
+verisynth init -o skeleton.yaml [--input <data dir>] [--seed S] [--yes]
 ```
 
-Exit code 0 on success; `validate` exits 1 and prints violations if any.
+Exit code 0 on success; `validate` exits 1 and prints violations if any;
+`init` exits 1 if the assembled skeleton fails metadata validation (the file
+is still written for hand-editing).
+
+## 10. Metadata scanner & init wizard
+
+`verisynth scan` (scanner.py) profiles a directory of real
+`{table}.parquet` / `{table}.csv` files and reports, per table: column DSL
+types, null rates, distinct counts, and a ranked list of primary-key
+candidates (unique + non-null columns, ordered by name heuristics: `id` >
+`{table}_id`/`{singular}_id` > `*_id` > declaration order). Across tables it
+detects foreign-key relations by name signal (child column named like a
+parent's PK) confirmed by value containment (>= 95% of non-null child values
+present in the parent key). For each relation it profiles observed
+children-per-parent counts (zero-children parents included) and suggests a
+cardinality spec — `bernoulli` when max <= 1, `fixed` when constant,
+`poisson` when variance ~ mean, else `uniform_int` over the observed range —
+plus the matching `child_stride` (smallest power of two strictly above the
+effective max). Plain columns get a distribution suggestion (categorical /
+datetime_uniform / lognormal / normal / uniform_int) from observed values.
+All findings are advisory and carry their evidence (coverage, counts).
+
+`verisynth init` (wizard.py) turns those findings into a chat on the
+terminal: every structural decision — PK choice, parent selection when a
+table references several others, cardinality shape, per-column
+distributions, dimension `reference:` columns for secondary FKs into root
+tables — is one conversational question whose default is the scanner's
+suggestion, so a skeleton is assembled with Enter presses (or unattended
+with `--yes`). Without `--input` the wizard asks the same questions from
+scratch with placeholder parameters for `verisynth fit` to refine. The
+result is validated with `parse_metadata` before writing. Derived columns
+remain hand-authored (§2).
+
+Deterministic structural-inference rules (shared by chat defaults and
+`--yes` mode; all thresholds fixed):
+
+- **FK containment**: ≥ 98% of non-null child values present in the other
+  table's PK (name-matched), on a sample of ≤ 100k rows per table.
+- **Parent vs reference**: with several FK candidates the parent is the one
+  with the smallest mean children-per-parent (ties: alphabetical); the rest
+  become `reference:` columns with `zipf{a: 0.5, n: rows}` placeholders.
+- **Parent-as-PK**: a table whose chosen PK is itself ≥ 98% contained in
+  another table's PK is a `bernoulli` child of that table — the column
+  becomes `generator: parent_key` and a synthetic `{table}_id` key is added
+  (more rows → parent; equal → alphabetical first; cycles drop the
+  lowest-coverage link with a warning).
+- **Temporal anchors**: timestamp column b anchors on the candidate a
+  (same-table, or parent timestamp joined via the FK) with the smallest
+  median positive delay among those where `b − a ≥ 0` holds for ≥ 98% of
+  joint non-null rows; processing earliest-median-first keeps the anchor
+  graph acyclic. No candidate → `datetime_uniform` over the observed range.
+  Delay placeholders are `lognormal{10, 1}` for `verisynth fit` to refine.
+- **Copula proposals**: per table, pairs of numeric/int-categorical columns
+  with |Spearman| ≥ 0.3 form edges; each connected component of ≥ 2 columns
+  becomes one group (`corr_1`, `corr_2`, …) with an identity placeholder
+  matrix.
+- **Sources**: repeatable `--source NAME=PATTERN` (fnmatch, first match
+  wins) assigns `source:` labels in both chat and `--yes` modes.
