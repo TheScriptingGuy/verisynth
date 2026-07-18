@@ -392,5 +392,31 @@ tables — is one conversational question whose default is the scanner's
 suggestion, so a skeleton is assembled with Enter presses (or unattended
 with `--yes`). Without `--input` the wizard asks the same questions from
 scratch with placeholder parameters for `verisynth fit` to refine. The
-result is validated with `parse_metadata` before writing. Temporal chains,
-copulas, and derived columns remain hand-authored (§2).
+result is validated with `parse_metadata` before writing. Derived columns
+remain hand-authored (§2).
+
+Deterministic structural-inference rules (shared by chat defaults and
+`--yes` mode; all thresholds fixed):
+
+- **FK containment**: ≥ 98% of non-null child values present in the other
+  table's PK (name-matched), on a sample of ≤ 100k rows per table.
+- **Parent vs reference**: with several FK candidates the parent is the one
+  with the smallest mean children-per-parent (ties: alphabetical); the rest
+  become `reference:` columns with `zipf{a: 0.5, n: rows}` placeholders.
+- **Parent-as-PK**: a table whose chosen PK is itself ≥ 98% contained in
+  another table's PK is a `bernoulli` child of that table — the column
+  becomes `generator: parent_key` and a synthetic `{table}_id` key is added
+  (more rows → parent; equal → alphabetical first; cycles drop the
+  lowest-coverage link with a warning).
+- **Temporal anchors**: timestamp column b anchors on the candidate a
+  (same-table, or parent timestamp joined via the FK) with the smallest
+  median positive delay among those where `b − a ≥ 0` holds for ≥ 98% of
+  joint non-null rows; processing earliest-median-first keeps the anchor
+  graph acyclic. No candidate → `datetime_uniform` over the observed range.
+  Delay placeholders are `lognormal{10, 1}` for `verisynth fit` to refine.
+- **Copula proposals**: per table, pairs of numeric/int-categorical columns
+  with |Spearman| ≥ 0.3 form edges; each connected component of ≥ 2 columns
+  becomes one group (`corr_1`, `corr_2`, …) with an identity placeholder
+  matrix.
+- **Sources**: repeatable `--source NAME=PATTERN` (fnmatch, first match
+  wins) assigns `source:` labels in both chat and `--yes` modes.
