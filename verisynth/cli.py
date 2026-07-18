@@ -16,7 +16,7 @@ from .engine import Engine
 from .explain import explain_metadata
 from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
-from .scanner import render_report, report_to_dict, scan_directory
+from .scanner import init_from_dir, render_report, report_to_dict, scan_directory
 from .wizard import Chat, WizardAborted, run_wizard
 
 
@@ -98,10 +98,52 @@ def _cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_sources(raw: list[str] | None) -> list[tuple[str, str]] | None:
+    if not raw:
+        return None
+    out = []
+    for item in raw:
+        if "=" not in item:
+            raise ValueError(f"--source must be NAME=PATTERN (got {item!r})")
+        name, pattern = item.split("=", 1)
+        out.append((name, pattern))
+    return out
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
+    try:
+        sources = _parse_sources(args.source)
+    except ValueError as e:
+        print(f"init: {e}", file=sys.stderr)
+        return 1
+
+    if args.yes:
+        # Non-interactive path: deterministic structural inference (TASK
+        # CARD 16) over real data -- no chat, no defaults to accept.
+        if not args.input:
+            print("init: --yes requires --input <data dir>", file=sys.stderr)
+            return 1
+        seed = args.seed if args.seed is not None else 42
+        try:
+            warnings = init_from_dir(args.input, args.out, seed=seed, sources=sources)
+        except FileNotFoundError as e:
+            print(f"init: {e}", file=sys.stderr)
+            return 1
+        md = load_metadata(args.out)
+        for tname in sorted(md.tables):
+            t = md.tables[tname]
+            wcount = sum(1 for w in warnings if tname in w)
+            print(
+                f"{tname}: role={t.role} parent={t.parent} pk={t.primary_key} "
+                f"columns={len(t.columns)} warnings={wcount}"
+            )
+        for w in warnings:
+            print(f"warning: {w}")
+        return 0
+
     chat = Chat(assume_yes=args.yes)
     try:
-        return run_wizard(args.out, input_dir=args.input, seed=args.seed, chat=chat)
+        return run_wizard(args.out, input_dir=args.input, seed=args.seed, chat=chat, sources=sources)
     except (WizardAborted, FileNotFoundError) as e:
         print(f"init: {e}", file=sys.stderr)
         return 1
@@ -151,6 +193,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--seed", type=int, default=None)
     p_init.add_argument(
         "-y", "--yes", action="store_true", help="accept every suggestion (non-interactive)"
+    )
+    p_init.add_argument(
+        "--source",
+        action="append",
+        default=None,
+        metavar="NAME=PATTERN",
+        help="assign table source by fnmatch pattern (repeatable, first match wins)",
     )
     p_init.set_defaults(func=_cmd_init)
 

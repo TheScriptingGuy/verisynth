@@ -22,6 +22,7 @@ from .metadata import MetadataError, parse_metadata
 from .scanner import (
     Relation,
     ScanReport,
+    assign_source,
     rank_parent_relations,
     scan_directory,
 )
@@ -415,6 +416,7 @@ def run_wizard(
     input_dir: str | Path | None = None,
     seed: int | None = None,
     chat: Chat | None = None,
+    sources: list[tuple[str, str]] | None = None,
 ) -> int:
     chat = chat or Chat()
     chat.say(
@@ -454,6 +456,12 @@ def run_wizard(
             tables[tname] = _build_table_from_scratch(
                 chat, tname, [n for n in names if n != tname and n in tables]
             )
+
+    if sources:
+        for tname, spec in tables.items():
+            src = assign_source(tname, sources)
+            if src is not None:
+                spec["source"] = src
 
     doc = {"version": 1, "seed": seed, "tables": tables}
 

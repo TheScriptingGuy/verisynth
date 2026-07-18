@@ -204,7 +204,10 @@ def test_cli_scan_and_init_e2e(data_dir, tmp_path):
     skeleton = tmp_path / "skeleton.yaml"
     result = _run("init", "--input", str(data_dir), "--yes", "-o", str(skeleton), "--seed", "9")
     assert result.returncode == 0, result.stderr
-    assert "you ▸" in result.stdout  # the transcript reads like a chat
+    # `--yes` is the non-interactive, deterministic inference path (TASK
+    # CARD 16): it prints a structural summary, not a chat transcript.
+    assert "role=" in result.stdout
+    assert "pk=" in result.stdout
 
     out_dir = tmp_path / "out"
     result = _run("generate", "-m", str(skeleton), "-o", str(out_dir), "--seed", "9")

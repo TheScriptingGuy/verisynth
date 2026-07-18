@@ -20,9 +20,13 @@ from typing import Any
 
 import polars as pl
 
+from ._skeleton_infer import assign_source, infer_skeleton, init_from_dir  # noqa: F401
+
 # Containment threshold for accepting a foreign-key candidate: at least this
 # fraction of the child column's non-null values must exist in the parent key.
-FK_COVERAGE_THRESHOLD = 0.95
+# Shared with the deterministic inference layer (_skeleton_infer.py, TASK
+# CARD 16 rule 2).
+FK_COVERAGE_THRESHOLD = 0.98
 
 # Max distinct values for a categorical distribution suggestion.
 _CATEGORICAL_MAX = 20
@@ -287,13 +291,17 @@ def _cardinality_profile(
 def _fk_candidate_parents(
     table: str, column: ColumnProfile, tables: dict[str, TableScan]
 ) -> list[str]:
-    """Parent tables whose primary key this column could reference, by name."""
+    """Parent tables whose primary key this column could reference, by name.
+
+    Shared rule with the deterministic inference layer (_skeleton_infer.py,
+    TASK CARD 16 rule 2): a column is only a candidate if its name is
+    literally the same as the other table's chosen primary key column.
+    """
     out = []
     for pname, pscan in tables.items():
         if pname == table or pscan.pk is None:
             continue
-        pk = pscan.pk
-        if column.name == pk or column.name == f"{_singular(pname)}_id":
+        if column.name == pscan.pk:
             out.append(pname)
     return out
 

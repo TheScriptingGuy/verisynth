@@ -50,8 +50,11 @@ pip install dist/verisynth_kernels-*.whl
 verisynth scan --input real/
 
 # build a metadata skeleton through an interactive chat -- point it at real
-# data and every question comes pre-answered by the scanner (--yes accepts all)
-verisynth init --input real/ -o skeleton.yaml
+# data and every question comes pre-answered by the scanner (--yes runs the
+# same structural inference non-interactively: PKs, parents/references,
+# cardinality, temporal anchors, copula proposals -- see docs/ARCHITECTURE.md
+# §2, §3, §7); --source NAME=PATTERN (repeatable) assigns table sources
+verisynth init --input real/ -o skeleton.yaml --yes
 
 # generate a dataset from metadata (see examples/retail.yaml)
 verisynth generate -m examples/retail.yaml -o out/ --partitions 4 --seed 42
