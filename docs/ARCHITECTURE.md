@@ -113,7 +113,9 @@ env var `VERISYNTH_FORCE_REFERENCE=1`, use `verisynth._reference`. Module attrib
 `BACKEND` is `"rust"` or `"reference"`.
 
 Uniform outputs must be **bit-identical** across backends; `inv_norm_cdf` must agree
-within `1e-12` absolute.
+within `1e-12` absolute. (Acklam's approximation itself is accurate to ~4e-9 absolute
+vs the true Φ⁻¹ in the far tails — acceptable by design; no refinement step is used,
+so that both backends can implement the formula verbatim.)
 
 ## 2. Metadata DSL
 
