@@ -42,6 +42,13 @@ pip install dist/verisynth_kernels-*.whl
 ## Usage
 
 ```bash
+# scan real data files: detect PKs, FK relations, and cardinality profiles
+verisynth scan --input real/
+
+# build a metadata skeleton through an interactive chat -- point it at real
+# data and every question comes pre-answered by the scanner (--yes accepts all)
+verisynth init --input real/ -o skeleton.yaml
+
 # generate a dataset from metadata (see examples/retail.yaml)
 verisynth generate -m examples/retail.yaml -o out/ --partitions 4 --seed 42
 

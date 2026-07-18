@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from .backbone import ParquetBackbone, validate_dataset
 from .engine import Engine
 from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
+from .scanner import render_report, report_to_dict, scan_directory
+from .wizard import Chat, WizardAborted, run_wizard
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
@@ -67,6 +70,31 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        report = scan_directory(args.input)
+    except FileNotFoundError as e:
+        print(e, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(report_to_dict(report), indent=2, default=str))
+    else:
+        print(render_report(report))
+    return 0
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    chat = Chat(assume_yes=args.yes)
+    try:
+        return run_wizard(args.out, input_dir=args.input, seed=args.seed, chat=chat)
+    except (WizardAborted, FileNotFoundError) as e:
+        print(f"init: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninit: cancelled", file=sys.stderr)
+        return 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="verisynth")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -90,6 +118,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fit.add_argument("--epsilon", type=float, default=None)
     p_fit.add_argument("--dp-seed", type=int, default=0)
     p_fit.set_defaults(func=_cmd_fit)
+
+    p_scan = sub.add_parser(
+        "scan", help="scan real data files and report detected keys, relations, cardinality"
+    )
+    p_scan.add_argument("--input", required=True, help="dir with {table}.parquet/.csv files")
+    p_scan.add_argument("--json", action="store_true", help="emit the report as JSON")
+    p_scan.set_defaults(func=_cmd_scan)
+
+    p_init = sub.add_parser(
+        "init", help="build a metadata skeleton through an interactive chat"
+    )
+    p_init.add_argument("-o", "--out", required=True, help="path for the skeleton YAML")
+    p_init.add_argument(
+        "--input", default=None, help="optional data dir to scan for suggested answers"
+    )
+    p_init.add_argument("--seed", type=int, default=None)
+    p_init.add_argument(
+        "-y", "--yes", action="store_true", help="accept every suggestion (non-interactive)"
+    )
+    p_init.set_defaults(func=_cmd_init)
 
     return parser
 
