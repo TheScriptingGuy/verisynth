@@ -485,9 +485,18 @@ def test_dimension_reference_on_generator_column_invalid():
     assert "sales.columns.shop_id.reference" in str(excinfo.value)
 
 
-def test_zipf_distribution_a_le_1_invalid():
+def test_zipf_distribution_a_negative_invalid():
     doc = _dimref_doc()
-    doc["tables"]["sales"]["columns"]["product_ref"]["distribution"]["a"] = 1.0
+    doc["tables"]["sales"]["columns"]["product_ref"]["distribution"]["a"] = -0.1
     with pytest.raises(MetadataError) as excinfo:
         parse_metadata(doc)
     assert "sales.columns.product_ref.distribution" in str(excinfo.value)
+
+
+def test_zipf_distribution_a_zero_valid():
+    # Finite zipfian is well-defined for a >= 0; a = 0 is the uniform
+    # distribution over ranks (docs/ARCHITECTURE.md §2).
+    doc = _dimref_doc()
+    doc["tables"]["sales"]["columns"]["product_ref"]["distribution"]["a"] = 0.0
+    md = parse_metadata(doc)
+    assert md.tables["sales"].columns["product_ref"].distribution.params["a"] == 0.0

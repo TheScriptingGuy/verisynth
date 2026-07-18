@@ -322,6 +322,13 @@ tables:
             kind: lognormal
             mu: 13.160587440220466
             sigma: 0.41160577377773455
+      product_id:
+        type: int64
+        distribution:
+          kind: zipf
+          a: 0.6
+          n: 9361
+        reference: inv_products
     source: shop
     parent: orders
     cardinality:
@@ -471,3 +478,296 @@ tables:
       lam: 1.0052234474753337
       max: 5
     child_stride: 8
+  inv_products:
+    role: root
+    primary_key: product_id
+    columns:
+      product_id:
+        type: int64
+        generator: key
+      category:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - agro_industry_and_commerce
+          - air_conditioning
+          - art
+          - arts_and_craftmanship
+          - audio
+          - auto
+          - baby
+          - bed_bath_table
+          - books_general_interest
+          - books_imported
+          - books_technical
+          - cds_dvds_musicals
+          - christmas_supplies
+          - cine_photo
+          - computers
+          - computers_accessories
+          - consoles_games
+          - construction_tools_construction
+          - construction_tools_lights
+          - construction_tools_safety
+          - cool_stuff
+          - costruction_tools_garden
+          - costruction_tools_tools
+          - diapers_and_hygiene
+          - drinks
+          - dvds_blu_ray
+          - electronics
+          - fashio_female_clothing
+          - fashion_bags_accessories
+          - fashion_childrens_clothes
+          - fashion_male_clothing
+          - fashion_shoes
+          - fashion_sport
+          - fashion_underwear_beach
+          - fixed_telephony
+          - flowers
+          - food
+          - food_drink
+          - furniture_bedroom
+          - furniture_decor
+          - furniture_living_room
+          - furniture_mattress_and_upholstery
+          - garden_tools
+          - health_beauty
+          - home_appliances
+          - home_appliances_2
+          - home_comfort_2
+          - home_confort
+          - home_construction
+          - housewares
+          - industry_commerce_and_business
+          - kitchen_dining_laundry_garden_furniture
+          - luggage_accessories
+          - market_place
+          - music
+          - musical_instruments
+          - office_furniture
+          - party_supplies
+          - perfumery
+          - pet_shop
+          - security_and_services
+          - signaling_and_security
+          - small_appliances
+          - small_appliances_home_oven_and_coffee
+          - sports_leisure
+          - stationery
+          - tablets_printing_image
+          - telephony
+          - toys
+          - unknown
+          - watches_gifts
+          probs:
+          - 0.0021365238756543103
+          - 0.003418438201046897
+          - 0.0012819143253925862
+          - 0.00021365238756543105
+          - 0.002457002457002457
+          - 0.048819570558700995
+          - 0.03226151052238009
+          - 0.09208417904070078
+          - 0.006409571626962931
+          - 0.0009614357440444397
+          - 0.00309795961969875
+          - 0.00010682619378271552
+          - 0.0012819143253925862
+          - 0.0011750881316098707
+          - 0.0011750881316098707
+          - 0.055442794573229356
+          - 0.01121675034718513
+          - 0.010148488409357975
+          - 0.002243350069437026
+          - 0.002670654844567888
+          - 0.028415767546202328
+          - 0.0023501762632197414
+          - 0.0011750881316098707
+          - 0.00021365238756543105
+          - 0.0023501762632197414
+          - 0.0006409571626962931
+          - 0.020083324431150518
+          - 0.0006409571626962931
+          - 0.022326674500587545
+          - 0.00032047858134814656
+          - 0.002243350069437026
+          - 0.0027774810383506036
+          - 0.0004273047751308621
+          - 0.0016023929067407329
+          - 0.00309795961969875
+          - 0.0005341309689135776
+          - 0.00309795961969875
+          - 0.002457002457002457
+          - 0.0010682619378271552
+          - 0.07424420467898729
+          - 0.005982266851832069
+          - 0.00032047858134814656
+          - 0.022326674500587545
+          - 0.07638072855464159
+          - 0.010041662215575259
+          - 0.003418438201046897
+          - 0.00021365238756543105
+          - 0.003952569169960474
+          - 0.005982266851832069
+          - 0.06505715201367375
+          - 0.0023501762632197414
+          - 0.0025638286507851725
+          - 0.011109924153402414
+          - 0.0035252643948296123
+          - 0.00021365238756543105
+          - 0.007691485952355518
+          - 0.012071359897446853
+          - 0.00032047858134814656
+          - 0.029911334259160347
+          - 0.021792543531673966
+          - 0.00010682619378271552
+          - 0.001816045294306164
+          - 0.008011964533703664
+          - 0.0005341309689135776
+          - 0.08887939322721931
+          - 0.02457002457002457
+          - 0.00032047858134814656
+          - 0.04080760602499733
+          - 0.04326460848199978
+          - 0.015703450486059183
+          - 0.04208952035038992
+      weight_g:
+        type: float64
+        distribution:
+          kind: lognormal
+          mu: 6.708564988585446
+          sigma: 1.3485857844248659
+      length_cm:
+        type: float64
+        distribution:
+          kind: lognormal
+          mu: 3.305428448767711
+          sigma: 0.46130454606101856
+      height_cm:
+        type: float64
+        distribution:
+          kind: lognormal
+          mu: 2.5292035378996824
+          sigma: 0.7904530174153303
+      width_cm:
+        type: float64
+        distribution:
+          kind: lognormal
+          mu: 3.028659355785923
+          sigma: 0.4573067142648403
+      photos_qty:
+        type: int64
+        distribution:
+          kind: categorical
+          categories:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 17
+          - 18
+          - 19
+          probs:
+          - 0.01548979809849375
+          - 0.48541822454865935
+          - 0.1947441512658904
+          - 0.11644055122315992
+          - 0.08022647153081935
+          - 0.04689669907061211
+          - 0.031834205747249225
+          - 0.012605490866360432
+          - 0.006516397820745647
+          - 0.0035252643948296123
+          - 0.00309795961969875
+          - 0.0016023929067407329
+          - 0.0004273047751308621
+          - 0.0005341309689135776
+          - 0.00021365238756543105
+          - 0.00010682619378271552
+          - 0.00010682619378271552
+          - 0.00010682619378271552
+          - 0.00010682619378271552
+    source: inventory
+    rows: 9361
+  inv_shipments:
+    role: child
+    primary_key: shipment_id
+    columns:
+      shipment_id:
+        type: int64
+        generator: key
+      order_id:
+        type: int64
+        generator: parent_key
+      warehouse:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - MG-01
+          - RJ-01
+          - SP-01
+          - SP-02
+          probs:
+          - 0.10061777076761304
+          - 0.14714773922187172
+          - 0.5519847528916929
+          - 0.2002497371188223
+      carrier:
+        type: string
+        distribution:
+          kind: categorical
+          categories:
+          - azul_cargo
+          - correios
+          - jadlog
+          - other
+          probs:
+          - 0.12112250262881177
+          - 0.623356992639327
+          - 0.1775105152471083
+          - 0.07800998948475289
+      created_at:
+        type: timestamp
+        temporal:
+          anchor: orders.order_purchase_timestamp
+          delay:
+            kind: lognormal
+            mu: 10.214759315628708
+            sigma: 0.8035057302300498
+      picked_at:
+        type: timestamp
+        temporal:
+          anchor: created_at
+          delay:
+            kind: lognormal
+            mu: 10.808280539994122
+            sigma: 0.6996774081027188
+      handed_over_at:
+        type: timestamp
+        temporal:
+          anchor: picked_at
+          delay:
+            kind: lognormal
+            mu: 9.907759903200285
+            sigma: 0.8989801220497389
+    source: inventory
+    parent: orders
+    cardinality:
+      kind: bernoulli
+      p: 0.9812342812923196
+    child_stride: 2

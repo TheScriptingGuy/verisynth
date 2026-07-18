@@ -597,6 +597,21 @@ def test_fit_reference_column_recovers_zipf_a_and_n():
     assert abs(dist.params["a"] - TRUE_ZIPF_A) < 0.15
 
 
+def test_fit_reference_column_recovers_near_uniform_zipf_a():
+    # Finite zipfian is well-defined for a >= 0 (a = 0 is uniform over
+    # ranks); the MLE grid must reach into this near-uniform region rather
+    # than saturating at some a > 1 floor (docs/ARCHITECTURE.md §2, §7).
+    skeleton = _dimref_fit_skeleton()
+    frames = _dimref_fit_frames(a=0.15)
+
+    fitted = fit_metadata(frames, skeleton)
+
+    dist = fitted.tables["sales"].columns["product_ref"].distribution
+    assert dist.kind == "zipf"
+    assert dist.params["n"] == N_DIMREF_PRODUCTS
+    assert abs(dist.params["a"] - 0.15) < 0.15
+
+
 def test_fit_reference_column_dp_path_unnoised():
     skeleton = _dimref_fit_skeleton()
     frames = _dimref_fit_frames()

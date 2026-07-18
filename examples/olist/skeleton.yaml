@@ -119,6 +119,14 @@ tables:
       shipping_limit_date:
         type: timestamp
         temporal: {anchor: orders.order_purchase_timestamp, delay: {kind: lognormal, mu: 12.5, sigma: 0.7}}
+      # Master-data dimension reference (TASK CARD 14, docs/ARCHITECTURE.md
+      # §2 / §8): points into the inventory system's product catalog via a
+      # fitted zipf popularity distribution -- only the popularity profile
+      # is released, not row-level product identity.
+      product_id:
+        type: int64
+        distribution: {kind: zipf, a: 1.5, n: 9361}
+        reference: inv_products
     copulas:
       - name: basket
         columns: [price, freight_value]
@@ -162,3 +170,62 @@ tables:
       review_creation_date:
         type: timestamp
         temporal: {anchor: orders.order_purchase_timestamp, delay: {kind: lognormal, mu: 13.0, sigma: 0.8}}
+  # --- Inventory source: master product catalog + shipment orders (TASK
+  # CARD 14, docs/ARCHITECTURE.md §8). inv_products is a root dimension
+  # table -- real product data (prepare_inventory_data.py) -- referenced by
+  # shop.order_items.product_id via a fitted zipf popularity distribution.
+  # inv_shipments is a child of the *shop's* orders table: the shop order is
+  # leading, the shipment order is created by the inventory system some time
+  # later (temporal anchor + strictly-positive delay) and references the
+  # original order via parent_key -- the "child-of-another-source's-facts"
+  # pattern. ---
+  inv_products:
+    role: root
+    rows: 9361
+    source: inventory
+    primary_key: product_id
+    columns:
+      product_id: {type: int64, generator: key}
+      category:
+        type: string
+        distribution: {kind: categorical, categories: [beleza_saude, cama_mesa_banho], probs: [0.5, 0.5]}
+      weight_g:
+        type: float64
+        distribution: {kind: lognormal, mu: 6.5, sigma: 1.2}
+      length_cm:
+        type: float64
+        distribution: {kind: lognormal, mu: 6.5, sigma: 1.2}
+      height_cm:
+        type: float64
+        distribution: {kind: lognormal, mu: 6.5, sigma: 1.2}
+      width_cm:
+        type: float64
+        distribution: {kind: lognormal, mu: 6.5, sigma: 1.2}
+      photos_qty:
+        type: int64
+        distribution: {kind: categorical, categories: [1, 2, 3], probs: [0.3333333333, 0.3333333333, 0.3333333334]}
+  inv_shipments:
+    role: child
+    parent: orders
+    source: inventory
+    cardinality: {kind: bernoulli, p: 0.97}
+    child_stride: 2
+    primary_key: shipment_id
+    columns:
+      shipment_id: {type: int64, generator: key}
+      order_id:    {type: int64, generator: parent_key}
+      warehouse:
+        type: string
+        distribution: {kind: categorical, categories: [SP-01, SP-02], probs: [0.5, 0.5]}
+      carrier:
+        type: string
+        distribution: {kind: categorical, categories: [correios, jadlog], probs: [0.5, 0.5]}
+      created_at:
+        type: timestamp
+        temporal: {anchor: orders.order_purchase_timestamp, delay: {kind: lognormal, mu: 10.2, sigma: 0.8}}
+      picked_at:
+        type: timestamp
+        temporal: {anchor: created_at, delay: {kind: lognormal, mu: 10.8, sigma: 0.7}}
+      handed_over_at:
+        type: timestamp
+        temporal: {anchor: picked_at, delay: {kind: lognormal, mu: 9.9, sigma: 0.9}}

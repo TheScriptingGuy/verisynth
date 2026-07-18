@@ -270,7 +270,7 @@ def _marginal_dp_entry(
     return None  # datetime marginals: released without noise, no budget cost
 
 
-_ZIPF_A_GRID = np.round(np.arange(1.05, 3.5001, 0.05), 2)
+_ZIPF_A_GRID = np.round(np.arange(0.0, 3.5001, 0.05), 2)
 
 
 def _fit_zipf_a(counts_desc: np.ndarray, n: int) -> float:
@@ -278,7 +278,14 @@ def _fit_zipf_a(counts_desc: np.ndarray, n: int) -> float:
     given observed value counts sorted in descending-frequency order (rank 0
     = most frequent). Vectorized over the grid and over ``n`` (no
     grid x n Python loop). Ties -> smaller ``a`` (grid is ascending and
-    ``np.argmax`` returns the first maximum)."""
+    ``np.argmax`` returns the first maximum).
+
+    Grid starts at ``a = 0`` (finite zipfian is well-defined for ``a >= 0``;
+    ``a = 0`` is the uniform distribution over ranks -- see
+    docs/ARCHITECTURE.md §2, §7). At ``a = 0`` every ``j**-a`` term is 1, so
+    ``H(n, 0) = n`` falls out of the same vectorized formula below with no
+    special-casing (no ``log(0)``: ranks are 1-indexed, so ``log_ranks`` and
+    ``log_j`` are always finite)."""
     if counts_desc.size == 0 or n <= 0:
         return float(_ZIPF_A_GRID[0])
 

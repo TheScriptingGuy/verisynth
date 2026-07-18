@@ -87,12 +87,18 @@ def prepare(csv_dir: Path, out_dir: Path, sample_customers: int) -> dict[str, in
     kept_order_ids = set(orders_df["order_id"].to_list())
 
     # --- 4. order_items ---
+    # ``product_id`` (raw string hash from olist_order_items_dataset.csv) is
+    # kept as-is: it is the real master-data linkage consumed by
+    # prepare_inventory_data.py (TASK CARD 14) to build the product catalog
+    # and, in skeleton.yaml, becomes a fitted zipf popularity `reference:`
+    # into `inv_products` (docs/ARCHITECTURE.md §8).
     items_raw = _read_csv(csv_dir, "olist_order_items_dataset.csv")
     order_items_df = (
         items_raw.filter(pl.col("order_id").is_in(kept_order_ids))
         .select(
             [
                 pl.col("order_id"),
+                pl.col("product_id"),
                 pl.col("price"),
                 pl.col("freight_value").clip(lower_bound=0.01),
                 pl.col("shipping_limit_date").str.to_datetime(strict=False),

@@ -1,15 +1,17 @@
 """Integration tests for the Olist example (TASK CARD 9, extended by
-TASK CARD 12 for the two-source CRM/shop dataset).
+TASK CARD 12 for the two-source CRM/shop dataset, and TASK CARD 14 for the
+third "inventory" source: master product catalog + shipment orders).
 
 Exercises the committed `examples/olist` sample end-to-end: skeleton/fitted
 metadata loading, fit reproducibility against the committed
 `metadata.olist.yaml` "expected output" artifact, generation + validation,
 statistical fidelity vs. the committed source sample, cross-source
-master-data consistency (CRM as customer master), and determinism.
+master-data consistency (CRM as customer master; inventory as product
+master + shipment orders as children of shop orders), and determinism.
 
 The committed Parquet sample under `examples/olist/data/` is small (15k
-shop customers, 25k CRM contacts) and always present, so these tests always
-run (no skip marker).
+shop customers, 25k CRM contacts, ~9.4k inventory products) and always
+present, so these tests always run (no skip marker).
 """
 
 from __future__ import annotations
@@ -35,8 +37,9 @@ SKELETON_PATH = OLIST_DIR / "skeleton.yaml"
 FITTED_PATH = OLIST_DIR / "metadata.olist.yaml"
 DATA_DIR = OLIST_DIR / "data"
 
-# All 7 tables across both source systems (crm: crm_contacts, crm_tickets;
-# shop: customers, orders, order_items, order_payments, order_reviews).
+# All 9 tables across the three source systems (crm: crm_contacts,
+# crm_tickets; shop: customers, orders, order_items, order_payments,
+# order_reviews; inventory: inv_products, inv_shipments).
 TABLE_NAMES = (
     "crm_contacts",
     "crm_tickets",
@@ -45,6 +48,8 @@ TABLE_NAMES = (
     "order_items",
     "order_payments",
     "order_reviews",
+    "inv_products",
+    "inv_shipments",
 )
 
 SOURCE_TABLES = (
@@ -55,6 +60,8 @@ SOURCE_TABLES = (
     ("shop", "order_items"),
     ("shop", "order_payments"),
     ("shop", "order_reviews"),
+    ("inventory", "inv_products"),
+    ("inventory", "inv_shipments"),
 )
 
 
@@ -76,6 +83,18 @@ def _load_crm_prep_module():
     is not a package) to import its authored ground-truth constants."""
     path = OLIST_DIR / "prepare_crm_data.py"
     spec = importlib.util.spec_from_file_location("olist_prepare_crm_data", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_inventory_prep_module():
+    """Load ``examples/olist/prepare_inventory_data.py`` by path (mirrors
+    ``_load_crm_prep_module``) to import its authored ground-truth
+    constants (TASK CARD 14)."""
+    path = OLIST_DIR / "prepare_inventory_data.py"
+    spec = importlib.util.spec_from_file_location("olist_prepare_inventory_data", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -134,6 +153,11 @@ def fitted_metadata():
 @pytest.fixture(scope="module")
 def crm_prep_module():
     return _load_crm_prep_module()
+
+
+@pytest.fixture(scope="module")
+def inventory_prep_module():
+    return _load_inventory_prep_module()
 
 
 @pytest.fixture(scope="module")
@@ -490,3 +514,180 @@ def test_determinism_across_sources_and_partitions(fitted_metadata):
     parts = [engine3.generate_partition(p, 3) for p in range(3)]
     concatenated = pa.concat_tables([parts[p]["customers"] for p in range(3)])
     assert concatenated.equals(single["customers"])
+
+
+# --------------------------------------------------------------------------
+# 9. Third source: inventory (master product catalog + shipment orders,
+#    TASK CARD 14, docs/ARCHITECTURE.md §2, §8).
+# --------------------------------------------------------------------------
+
+
+def test_inv_products_row_count_matches_distinct_products(fitted_metadata, source_frames):
+    skeleton = load_metadata(SKELETON_PATH)
+    distinct_products = source_frames["order_items"]["product_id"].n_unique()
+
+    assert skeleton.tables["inv_products"].rows == distinct_products
+    assert source_frames["inv_products"].height == distinct_products
+    assert fitted_metadata.tables["inv_products"].rows == distinct_products
+
+
+def test_fitted_shipments_bernoulli_p_matches_observed_share(fitted_metadata, source_frames):
+    orders = source_frames["orders"]
+    observed_share = orders["order_status"].is_in(["delivered", "shipped"]).mean()
+
+    card = fitted_metadata.tables["inv_shipments"].cardinality
+    assert card.kind == "bernoulli"
+    print(f"fitted bernoulli p = {card.params['p']!r}, observed share = {observed_share!r}")
+    assert abs(card.params["p"] - observed_share) < 0.01
+
+
+def test_fitted_inventory_categorical_fidelity(fitted_metadata, inventory_prep_module):
+    checks = [
+        ("inv_shipments", "warehouse", inventory_prep_module.WAREHOUSES, inventory_prep_module.WAREHOUSE_PROBS),
+        ("inv_shipments", "carrier", inventory_prep_module.CARRIERS, inventory_prep_module.CARRIER_PROBS),
+    ]
+    for table, column, categories, probs in checks:
+        fitted = _dist_probs(fitted_metadata, table, column)
+        for cat, authored_p in zip(categories, probs):
+            assert abs(fitted.get(cat, 0.0) - authored_p) < 0.02, (table, column, cat)
+
+
+def test_fitted_inv_products_category_matches_real_frequencies(fitted_metadata, source_frames):
+    fitted = _dist_probs(fitted_metadata, "inv_products", "category")
+    src_freq = _freq(source_frames["inv_products"]["category"])
+    for category, p in src_freq.items():
+        assert abs(fitted.get(category, 0.0) - p) < 0.02, category
+
+
+def test_fitted_product_id_zipf_a_in_range(fitted_metadata):
+    # Finite zipfian is well-defined for a >= 0 (a = 0 is uniform over
+    # ranks, docs/ARCHITECTURE.md §2); the real Olist per-product
+    # popularity in this sample is close to flat, so the fitted a should
+    # land well below 1, not saturate at some a > 1 grid floor.
+    dist = fitted_metadata.tables["order_items"].columns["product_id"].distribution
+    assert dist.kind == "zipf"
+    a = dist.params["a"]
+    print(f"fitted zipf a = {a!r}")
+    assert 0.0 <= a <= 3.5
+    assert dist.params["n"] == fitted_metadata.tables["inv_products"].rows
+
+
+def test_fitted_shipment_delays_match_authored(fitted_metadata, inventory_prep_module):
+    checks = [
+        ("created_at", inventory_prep_module.CREATED_AT_DELAY_MU, inventory_prep_module.CREATED_AT_DELAY_SIGMA),
+        ("picked_at", inventory_prep_module.PICKED_AT_DELAY_MU, inventory_prep_module.PICKED_AT_DELAY_SIGMA),
+        ("handed_over_at", inventory_prep_module.HANDED_OVER_DELAY_MU, inventory_prep_module.HANDED_OVER_DELAY_SIGMA),
+    ]
+    for column, mu, sigma in checks:
+        delay = fitted_metadata.tables["inv_shipments"].columns[column].temporal.delay
+        assert delay.kind == "lognormal"
+        assert abs(delay.params["mu"] - mu) < 0.05, column
+        assert abs(delay.params["sigma"] - sigma) < 0.05, column
+
+
+def test_inventory_output_layout(synth_out_dir):
+    for table in ("inv_products", "inv_shipments"):
+        table_dir = synth_out_dir / "inventory" / table
+        assert table_dir.is_dir(), table_dir
+        parts = sorted(table_dir.glob("part-*.parquet"))
+        assert len(parts) == 2, f"{table_dir}: expected 2 partitions, found {len(parts)}"
+
+
+def test_shipments_order_leading_and_strictly_later(fitted_metadata, synth_out_dir):
+    """Order-leading / strictly-later semantics (docs/ARCHITECTURE.md §8):
+    every inv_shipments row references a real shop order, and its
+    created_at is strictly after the order's purchase timestamp -- never
+    equal, never before."""
+    backbone = ParquetBackbone(synth_out_dir)
+    shipments_glob = backbone.table_glob("inv_shipments", fitted_metadata.tables["inv_shipments"].source)
+    orders_glob = backbone.table_glob("orders", fitted_metadata.tables["orders"].source)
+
+    con = duckdb.connect()
+    try:
+        (n_shipments,) = con.execute(f"SELECT count(*) FROM read_parquet('{shipments_glob}')").fetchone()
+        (n_matched,) = con.execute(
+            f"""
+            SELECT count(*) FROM read_parquet('{shipments_glob}') s
+            JOIN read_parquet('{orders_glob}') o ON s.order_id = o.order_id
+            """
+        ).fetchone()
+        assert n_matched == n_shipments
+
+        (violations,) = con.execute(
+            f"""
+            SELECT count(*) FROM read_parquet('{shipments_glob}') s
+            JOIN read_parquet('{orders_glob}') o ON s.order_id = o.order_id
+            WHERE s.created_at <= o.order_purchase_timestamp
+            """
+        ).fetchone()
+        print(f"strictly-later violations = {violations}")
+        assert violations == 0
+
+        (order_violations,) = con.execute(
+            f"""
+            SELECT count(*) FROM read_parquet('{shipments_glob}')
+            WHERE NOT (handed_over_at >= picked_at AND picked_at >= created_at)
+            """
+        ).fetchone()
+        assert order_violations == 0
+    finally:
+        con.close()
+
+
+def test_master_feeds_shop_product_reference(fitted_metadata, synth_out_dir, synth_frames, source_frames):
+    """Master fidelity for the dimension-reference pattern (docs/ARCHITECTURE.md
+    §2, §8): every synthetic order_items.product_id resolves to a real
+    generated inv_products row, and the synthetic popularity of the
+    top-ranked product tracks the *real* committed sample's top-product
+    share (not merely the fitted pmf it was derived from -- a genuine
+    real-data-fidelity check)."""
+    backbone = ParquetBackbone(synth_out_dir)
+    items_glob = backbone.table_glob("order_items", fitted_metadata.tables["order_items"].source)
+    products_glob = backbone.table_glob("inv_products", fitted_metadata.tables["inv_products"].source)
+
+    n_products = fitted_metadata.tables["inv_products"].rows
+
+    product_ref = synth_frames["order_items"]["product_id"].to_numpy()
+    assert product_ref.min() >= 0
+    assert product_ref.max() < n_products
+
+    con = duckdb.connect()
+    try:
+        (missing,) = con.execute(
+            f"""
+            SELECT count(*) FROM read_parquet('{items_glob}') i
+            LEFT JOIN read_parquet('{products_glob}') p ON i.product_id = p.product_id
+            WHERE p.product_id IS NULL
+            """
+        ).fetchone()
+        assert missing == 0
+    finally:
+        con.close()
+
+    src_counts = source_frames["order_items"]["product_id"].value_counts()
+    src_top_share = float(src_counts["count"].max()) / source_frames["order_items"].height
+
+    rank0_share = float((synth_frames["order_items"]["product_id"] == 0).mean())
+    print(
+        f"synthetic rank-0 empirical share = {rank0_share!r}, "
+        f"committed-sample real top-product share = {src_top_share!r}"
+    )
+    assert abs(rank0_share - src_top_share) < 0.02
+
+    n_shipments = synth_frames["inv_shipments"].height
+    n_orders = synth_frames["orders"].height
+    p_fitted = fitted_metadata.tables["inv_shipments"].cardinality.params["p"]
+    assert abs(n_shipments / n_orders - p_fitted) < 0.02
+
+
+def test_determinism_inv_shipments(fitted_metadata):
+    """Cross-source determinism (TASK CARD 14 §6): two independent Engines
+    over the same fitted metadata produce byte-identical inv_shipments."""
+    engine1 = Engine(load_metadata(FITTED_PATH))
+    engine2 = Engine(load_metadata(FITTED_PATH))
+
+    tables1 = engine1.generate_partition(0, 2)
+    tables2 = engine2.generate_partition(0, 2)
+
+    assert tables1["inv_shipments"].equals(tables2["inv_shipments"])
+    assert tables1["inv_products"].equals(tables2["inv_products"])

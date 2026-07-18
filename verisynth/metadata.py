@@ -413,8 +413,8 @@ def _validate_distribution(
             raise MetadataError(f"{path}: datetime_uniform requires start < end")
     elif dist.kind == "zipf":
         a, n = p.get("a"), p.get("n")
-        if not isinstance(a, (int, float)) or isinstance(a, bool) or not (a > 1):
-            raise MetadataError(f"{path}: zipf 'a' must be > 1 (got {a!r})")
+        if not isinstance(a, (int, float)) or isinstance(a, bool) or not (a >= 0):
+            raise MetadataError(f"{path}: zipf 'a' must be >= 0 (got {a!r})")
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             raise MetadataError(f"{path}: zipf 'n' must be an integer >= 1 (got {n!r})")
 

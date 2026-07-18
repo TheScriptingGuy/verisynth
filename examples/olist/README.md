@@ -4,9 +4,10 @@
 
 An end-to-end verisynth example built from the **Olist Brazilian E-Commerce**
 public dataset. It shows the full fit -> generate -> validate pipeline on a
-real, five-table relational dataset with categorical, numeric, and temporal
-(delay-chain) columns and Gaussian-copula correlations, rather than the
-synthetic data in `examples/retail.yaml`.
+real, nine-table relational dataset spanning **three source systems**
+(shop, CRM, inventory) with categorical, numeric, and temporal (delay-chain)
+columns, Gaussian-copula correlations, and a fitted zipf popularity
+dimension reference, rather than the synthetic data in `examples/retail.yaml`.
 
 Files:
 
@@ -14,6 +15,9 @@ Files:
   Parquet inputs `verisynth fit` expects (the "shop" source).
 - `prepare_crm_data.py` -- synthesizes a second source, a CRM system, from
   the shop sample (see "Two sources" below).
+- `prepare_inventory_data.py` -- builds a third source, a product inventory
+  system, from the raw product catalog plus the shop sample (see "Third
+  source: product inventory" below).
 - `skeleton.yaml` -- structural metadata (tables, keys, cardinalities,
   copula groups, temporal anchors) with placeholder distribution
   parameters, to be filled in by `verisynth fit`.
@@ -22,11 +26,14 @@ Files:
   output artifact; `tests/test_olist_integration.py` asserts that refitting
   the committed sample reproduces it.
 - `data/*.parquet` -- a committed, deterministic sample: 15,000 shop
-  customers (`customers.parquet`, `orders.parquet`, `order_items.parquet`,
-  `order_payments.parquet`, `order_reviews.parquet`) plus 25,000 synthesized
-  CRM contacts (`crm_contacts.parquet`, `crm_tickets.parquet`) -- see
-  "Attribution & license" below -- small enough (~3.3 MB total) to keep in
-  the repo so the integration tests always run.
+  customers (`customers.parquet`, `orders.parquet`, `order_items.parquet`
+  -- now including a real `product_id` column --, `order_payments.parquet`,
+  `order_reviews.parquet`) plus 25,000 synthesized CRM contacts
+  (`crm_contacts.parquet`, `crm_tickets.parquet`) plus a real
+  ~9,361-product inventory catalog and its synthesized shipment orders
+  (`inv_products.parquet`, `inv_shipments.parquet`) -- see "Attribution &
+  license" below -- small enough (~4.3 MB total) to keep in the repo so the
+  integration tests always run.
 
 ## Attribution & license
 
@@ -53,8 +60,11 @@ ShareAlike terms; consult the license before any other reuse.
 | `olist_order_items_dataset` | `order_items` | child of `orders`; one row per line item. |
 | `olist_order_payments_dataset` | `order_payments` | child of `orders`; a single order can have multiple payment rows (installments/split payments). |
 | `olist_order_reviews_dataset` | `order_reviews` | child of `orders`. |
-| `olist_products_dataset`, `olist_sellers_dataset`, `olist_geolocation_dataset` | *(not modeled)* | verisynth's current metadata DSL supports a single-parent tree per table (`role: child` + one `parent`); products/sellers are shared across many orders (many-to-many via order_items) and geolocation keys off zip-code prefix, neither of which fits the tree-shaped parent/child model. Modeling them would require multi-parent / reference-table support that is out of scope for this example. |
+| `olist_order_items_dataset.product_id` | `order_items.product_id` | the raw string hash, kept as real data in `data/order_items.parquet`; in `skeleton.yaml` it becomes a **dimension reference** (`reference: inv_products`, fitted `zipf{a, n}`) rather than a plain column -- see "Third source: product inventory" below. |
+| `olist_products_dataset` (joined to `product_category_name_translation.csv`) | `inv_products` | the real master product catalog, keyed off the distinct `product_id`s in the shop sample's `order_items`; root of the **inventory source** -- see "Third source: product inventory" below. |
+| `olist_sellers_dataset`, `olist_geolocation_dataset` | *(not modeled)* | sellers are shared across many orders (many-to-many via order_items, unlike the single-owner product catalog) and geolocation keys off zip-code prefix, neither of which fits the tree-shaped parent/child (or single dimension-reference) model. Modeling them would require multi-parent / many-to-many support that is out of scope for this example. |
 | *(synthesized, `prepare_crm_data.py`)* | `crm_contacts`, `crm_tickets` | a second **CRM source**, root of the whole tree; see "Two sources" below. |
+| *(synthesized, `prepare_inventory_data.py`)* | `inv_shipments` | shipment orders created by the inventory system from shop orders; child of `orders`; see "Third source: product inventory" below. |
 
 ## Data cleaning applied
 
@@ -69,6 +79,13 @@ ShareAlike terms; consult the license before any other reuse.
   (rather than, say, `order_delivered_customer_date`) since that is the only
   anchor guaranteed to be non-null for every order in the skeleton's
   temporal DAG.
+- `inv_products.category` is `"unknown"` where `product_category_name` is
+  null or has no row in `product_category_name_translation.csv`. The raw
+  catalog also has a single fully-null row (no category, dimensions, or
+  photo count) among the sampled products; its `weight_g`/`length_cm`/
+  `height_cm`/`width_cm` are filled with the sample median and
+  `photos_qty` with `0` (no `null_rate` is declared for these columns in
+  `skeleton.yaml`, so a real ~0.01% missingness rate isn't worth modeling).
 - Negative observed delays (an event timestamp earlier than its anchor, a
   handful of data-entry inconsistencies in the raw timestamps) are clamped
   to zero by `verisynth.fit._fit_temporal` before fitting the delay
@@ -121,7 +138,70 @@ and neighboring tests).
 
 Output layout after `verisynth generate` reflects the source split
 (`source:` routes output, per §6/§8 -- it doesn't change generation
-semantics):
+semantics); see "Third source: product inventory" below for the third
+(`inventory`) directory.
+
+## Third source: product inventory
+
+A third source system, **inventory**, is layered on via
+`prepare_inventory_data.py` (TASK CARD 14, docs/ARCHITECTURE.md §8, the
+second cross-source mechanism -- dimension references -- alongside the
+master-source/child pattern used for CRM):
+
+- **`inv_products`** (root, `source: inventory`) is the **master product
+  catalog** -- and unlike `crm_contacts`, this one is **real data**, not
+  synthesized: the distinct `product_id`s (9,361 of them) that appear in
+  the shop sample's `order_items.parquet`, joined against the raw
+  `olist_products_dataset.csv` and `product_category_name_translation.csv`
+  to attach `category` (English name; `"unknown"` when untranslated or
+  missing), `weight_g`, `length_cm`, `height_cm`, `width_cm`, and
+  `photos_qty`.
+- `shop.order_items` gains a real `product_id` column (the raw string hash)
+  in `data/order_items.parquet`. In `skeleton.yaml` it is declared with
+  `reference: inv_products` and an integer `zipf{a, n}` distribution: the
+  fitter (`_fit_reference_zipf`, docs/ARCHITECTURE.md §7) discards the
+  *identity* of which product each line item points to and instead fits
+  only the shape of the popularity profile (`a`, MLE over a deterministic
+  grid covering `a >= 0` -- the finite zipfian is well-defined down to
+  `a = 0`, uniform over ranks, docs/ARCHITECTURE.md §2) against the
+  referenced table's row count (`n = 9361`). In this sample the real
+  per-product popularity is close to flat -- 9,361 distinct products across
+  17,547 line items, top product ~0.47% of items -- so the fitted `a`
+  lands well below 1 (~0.6), not at some `a > 1` "long-tail" floor. This is
+  a **star-schema dimension reference**, not a parent/child relationship --
+  `order_items` doesn't become a child of `inv_products`, and every value
+  the engine samples is clipped to `[0, n-1]` by construction, so
+  referential integrity holds without a join at generation time (checked
+  anyway by `validate_dataset`'s reference-integrity SQL).
+- **`inv_shipments`** (child of `orders`, `source: inventory`) models
+  shipment orders the inventory system creates *from* shop orders -- the
+  "child-of-another-source's-facts" pattern (§8): the shop `orders` row is
+  leading, and `cardinality: bernoulli{p}` fits the fact that a shipment
+  exists only for orders whose `order_status` is `delivered` or `shipped`
+  (`prepare_inventory_data.py` emits exactly one shipment row per such
+  order, none otherwise -- a 0-or-1-per-order structure that
+  `verisynth fit` recovers as `bernoulli`, per §7). Its `order_id` column
+  is `generator: parent_key` (which shop order this shipment fulfills), and
+  `created_at` is **temporally anchored on the parent order's
+  `order_purchase_timestamp`** with a strictly-positive lognormal delay --
+  so a shipment can never be created before (or at the same instant as) its
+  order was placed. `picked_at` and `handed_over_at` chain further delays
+  off `created_at`/`picked_at` within the same table.
+
+`tests/test_olist_integration.py::test_shipments_order_leading_and_strictly_later`
+checks this end to end: every generated `inv_shipments` row joins to a real
+`orders` row (zero orphans) and `created_at > order_purchase_timestamp`
+strictly, for every row (not a statistical tolerance -- a hard invariant of
+the temporal-delay engine, docs/ARCHITECTURE.md §5, since delays are
+clamped at `>= 0` and the fitted lognormal has no zero-mass point).
+`test_master_feeds_shop_product_reference` checks the dimension-reference
+side: every synthetic `order_items.product_id` resolves to a generated
+`inv_products` row, and the synthetic top-ranked product's popularity share
+tracks the *real* committed sample's top-product share (a genuine
+real-data-fidelity check, not just self-consistency with the fitted pmf it
+was derived from) within 0.02 absolute -- both are well under 2%.
+
+Output layout now has three per-source directories:
 
 ```
 {out}/crm/crm_contacts/part-00000.parquet, ...
@@ -131,6 +211,8 @@ semantics):
 {out}/shop/order_items/part-00000.parquet, ...
 {out}/shop/order_payments/part-00000.parquet, ...
 {out}/shop/order_reviews/part-00000.parquet, ...
+{out}/inventory/inv_products/part-00000.parquet, ...
+{out}/inventory/inv_shipments/part-00000.parquet, ...
 ```
 
 ## How to regenerate from full data
@@ -140,7 +222,8 @@ semantics):
 #    local directory, e.g. ./olist-raw/ -- must contain at least:
 #    olist_customers_dataset.csv, olist_orders_dataset.csv,
 #    olist_order_items_dataset.csv, olist_order_payments_dataset.csv,
-#    olist_order_reviews_dataset.csv
+#    olist_order_reviews_dataset.csv, olist_products_dataset.csv,
+#    product_category_name_translation.csv
 
 # 2. Prepare the deterministic shop sample (or omit --sample-customers, or
 #    pass 0, to keep every customer):
@@ -155,17 +238,24 @@ python examples/olist/prepare_crm_data.py \
     --out examples/olist/data \
     --leads 10000
 
-# 4. Fit metadata parameters from both sources (skeleton.table_order() now
-#    covers all 7 tables -- crm_contacts.parquet/crm_tickets.parquet must
-#    exist alongside the shop *.parquet files under --input):
+# 4. Build the inventory source (real product catalog + synthesized
+#    shipment orders) from the raw CSVs and the shop sample:
+python examples/olist/prepare_inventory_data.py \
+    --csv-dir ./olist-raw \
+    --data-dir examples/olist/data \
+    --out examples/olist/data
+
+# 5. Fit metadata parameters from all three sources (skeleton.table_order()
+#    now covers all 9 tables -- crm_*.parquet and inv_*.parquet must exist
+#    alongside the shop *.parquet files under --input):
 verisynth fit --input examples/olist/data \
     -m examples/olist/skeleton.yaml \
     -o examples/olist/metadata.olist.yaml
 
-# 5. Generate a synthetic dataset:
+# 6. Generate a synthetic dataset:
 verisynth generate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth --partitions 2
 
-# 6. Validate it:
+# 7. Validate it:
 verisynth validate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth
 ```
 
@@ -188,11 +278,21 @@ verisynth validate -m examples/olist/metadata.olist.yaml -o /tmp/olist-synth
   `order_estimated_delivery_date` and `review_creation_date` anchored on
   purchase time, and `shipping_limit_date` anchored on the parent order's
   purchase time -- including each event's observed null rate.
+- The real product catalog's `category` frequencies and `weight_g`/
+  `length_cm`/`height_cm`/`width_cm`/`photos_qty` marginals
+  (`inv_products`), and the popularity *shape* with which shop
+  `order_items` reference the catalog (fitted zipf `a`, docs/ARCHITECTURE.md
+  §2/§7) -- though not which specific product is popular (identity is
+  discarded by design). The inventory system's shipment-order structure:
+  which orders get a shipment at all (fitted `bernoulli{p}`, matching the
+  `delivered`/`shipped` `order_status` share), `warehouse`/`carrier`
+  frequencies, and the `created_at -> picked_at -> handed_over_at` delay
+  chain anchored on the order's purchase time.
 
 ## What is not preserved
 
-- The product catalog, seller identities, and geolocation below the
-  state level (see "Schema mapping" above for why).
+- Seller identities and geolocation below the state level (see "Schema
+  mapping" above for why).
 - The dependency between `order_status` and which delivery-chain timestamps
   are null (e.g. a `canceled` order is far more likely to be missing
   `order_delivered_customer_date` than a `delivered` one). The skeleton
