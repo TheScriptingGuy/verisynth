@@ -1,0 +1,123 @@
+name: Publish verisynth_kernels (Rust) to PyPI
+
+# Builds the PyO3/maturin extension module `verisynth_kernels` as binary wheels
+# across Linux (manylinux + musllinux), macOS, and Windows, plus an sdist, and
+# publishes them to PyPI when a GitHub Release is published. The crate targets
+# the CPython stable ABI (abi3-py310), so one wheel per platform/arch covers
+# Python 3.10+. Authentication uses PyPI Trusted Publishing (OIDC) — no API
+# token or password is stored in the repository.
+
+on:
+  release:
+    types: [published]
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels (manylinux)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+          working-directory: rust
+      - name: Build wheels (musllinux)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: musllinux_1_2
+          working-directory: rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: rust/dist
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          working-directory: rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: rust/dist
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.target }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          working-directory: rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: rust/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: rust/dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for OIDC Trusted Publishing
+    steps:
+      - name: Download all wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
