@@ -44,7 +44,10 @@ jobs:
           pip install ".[dev]"
 
       - name: Build and install the Rust kernels
-        run: maturin develop --release -m rust/Cargo.toml
+        # Build + install the PyO3 extension via its maturin PEP-517 backend.
+        # (maturin develop needs an active virtualenv, which setup-python has
+        # not created — pip install builds in isolation and installs here.)
+        run: pip install ./rust
 
       - name: Run the test suite (Rust backend)
         run: python -m pytest -q
