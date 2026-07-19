@@ -842,6 +842,72 @@ def test_crm_tickets_jsonl_is_flat(synth_out_dir, synth_frames):
     assert set(first) == set(tickets.columns)
 
 
+def test_web_orders_payload_column_agrees_with_row(synth_frames):
+    """In-table document column (docs/ARCHITECTURE.md §11): every
+    web_orders.payload cell is a compact JSON serialization of its own row's
+    columns — cell-for-cell agreement, by construction."""
+    import json as json_mod
+    from datetime import datetime
+
+    web = synth_frames["web_orders"]
+    assert web["payload"].null_count() == 0
+
+    for row in web.iter_rows(named=True):
+        payload = json_mod.loads(row["payload"])
+        assert list(payload) == ["order_id", "status", "placed_at", "device", "utm_source"]
+        assert payload["order_id"] == row["order_id"]
+        assert payload["status"] == row["status"]
+        assert payload["device"] == row["device"]
+        assert payload["utm_source"] == row["utm_source"]
+        assert datetime.fromisoformat(payload["placed_at"]) == row["placed_at"]
+        assert "\n" not in row["payload"]
+
+
+def test_edi_shipments_message_column_agrees_with_row(synth_frames):
+    """edi_shipments.message stores the raw XSD-shaped <shipment> fragment
+    per row, matching the row's columns and the file export's element
+    structure (nested <routing> from edi_common.xsd)."""
+    import xml.etree.ElementTree as ET
+
+    edi = synth_frames["edi_shipments"]
+    for row in edi.iter_rows(named=True):
+        el = ET.fromstring(row["message"])
+        assert el.tag == "shipment"
+        assert [c.tag for c in el] == [
+            "edi_message_id",
+            "shipment_id",
+            "service_level",
+            "routing",
+            "dispatched_at",
+        ]
+        assert int(el.find("shipment_id").text) == row["shipment_id"]
+        assert el.find("routing/warehouse").text == row["warehouse"]
+        assert el.find("routing/carrier").text == row["carrier"]
+        assert el.find("service_level").text == row["service_level"]
+
+
+def test_scan_sees_through_generated_payload_columns(synth_out_dir, tmp_path, fitted_metadata):
+    """Read-route round trip: scanning a table whose payload column holds
+    JSON documents flattens it into typed leaf columns and drops the raw
+    payload from profiling."""
+    import shutil
+
+    from verisynth.scanner import scan_directory
+
+    scan_dir = tmp_path / "scan-payload"
+    scan_dir.mkdir()
+    src = synth_out_dir / "web" / "web_orders"
+    merged = pl.read_parquet(str(src / "*.parquet"))
+    merged.write_parquet(scan_dir / "web_orders.parquet")
+
+    report = scan_directory(scan_dir)
+    cols = set(report.tables["web_orders"].columns)
+    assert "payload" not in cols
+    # Leaf names collide with the real sibling columns, so the expansion
+    # lands under the payload-prefixed fallback names.
+    assert {"payload_order_id", "payload_status", "payload_device"} <= cols
+
+
 def test_document_determinism_across_partitions(tmp_path, fitted_metadata, synth_out_dir):
     """Documents are rendered from the Parquet partitions ordered by primary
     key, so the files are byte-identical for any partition count (the module

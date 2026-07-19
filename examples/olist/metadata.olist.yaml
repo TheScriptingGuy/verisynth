@@ -815,6 +815,16 @@ tables:
           - 0.0978267879022377
           - 0.349713032823886
           - 0.153737021990069
+      payload:
+        type: string
+        document:
+          kind: json
+          columns:
+          - order_id
+          - status
+          - placed_at
+          - device
+          - utm_source
     source: web
     format:
       kind: json
@@ -855,6 +865,14 @@ tables:
       dispatched_at:
         type: timestamp
         generator: parent:handed_over_at
+      message:
+        type: string
+        document:
+          kind: xml
+          schemas:
+          - schemas/edi_shipment.xsd
+          - schemas/edi_common.xsd
+          root: shipment
     source: edi
     format:
       kind: xml

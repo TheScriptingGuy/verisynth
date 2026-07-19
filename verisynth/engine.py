@@ -119,6 +119,10 @@ class Engine:
 
             # --- Step 6: null masks ---------------------------------------------------
             for cname, c in t.columns.items():
+                if c.document is not None:
+                    # Document columns aren't populated in `columns` until
+                    # Step 7.5 below; their own null_rate is applied there.
+                    continue
                 if c.null_rate <= 0:
                     continue
                 values, mask = columns[cname]
@@ -128,6 +132,8 @@ class Engine:
 
             # --- Step 7: clamp / round / cast -----------------------------------------
             for cname, c in t.columns.items():
+                if c.document is not None:
+                    continue
                 values, mask = columns[cname]
                 if c.clamp is not None and c.type in ("int64", "float64", "timestamp"):
                     values = np.clip(values, c.clamp[0], c.clamp[1])
@@ -148,6 +154,58 @@ class Engine:
                 # string: left as-is (object array).
 
                 columns[cname] = (values, mask)
+
+            # --- Step 7.5: document columns (in-table JSON/XML payloads) -------------
+            # A serialization of the row's own sibling columns, never
+            # independently sampled: no RNG draws here beyond the document
+            # column's own null-mask below. Imported lazily (matching the
+            # lazy `documents` import in `generate`) since documents is an
+            # optional leaf of the module graph.
+            doc_cnames = [cname for cname, c in t.columns.items() if c.document is not None]
+            if doc_cnames:
+                from . import documents
+
+                for cname in doc_cnames:
+                    c = t.columns[cname]
+                    renderer = documents.compile_column_document(md, t, cname)
+                    embedded = documents._resolve_document_columns(t, cname)
+
+                    per_column_values: dict[str, list] = {}
+                    for ecol in embedded:
+                        evalues, emask = columns[ecol]
+                        etype = t.columns[ecol].type
+                        if etype == "timestamp":
+                            pyvals = evalues.astype("datetime64[us]").tolist()
+                        elif etype == "int64":
+                            pyvals = [int(v) for v in evalues]
+                        elif etype == "float64":
+                            pyvals = [float(v) for v in evalues]
+                        elif etype == "bool":
+                            pyvals = [bool(v) for v in evalues]
+                        else:  # string
+                            pyvals = list(evalues)
+                        if emask is not None:
+                            pyvals = [
+                                None if emask[i] else pyvals[i] for i in range(n)
+                            ]
+                        per_column_values[ecol] = pyvals
+
+                    values = np.array(
+                        [
+                            renderer({ecol: per_column_values[ecol][i] for ecol in embedded})
+                            for i in range(n)
+                        ],
+                        dtype=object,
+                    )
+
+                    if c.null_rate > 0:
+                        mask = (
+                            kernels.keyed_uniforms(seed, f"{tname}.{cname}.__null__", row_keys)
+                            < c.null_rate
+                        )
+                    else:
+                        mask = None
+                    columns[cname] = (values, mask)
 
             state[tname] = {"row_keys": row_keys, "columns": columns}
 

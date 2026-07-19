@@ -75,6 +75,26 @@ class FormatSpec:
 
 
 @dataclass
+class ColumnDocumentSpec:
+    """In-table document column (docs/ARCHITECTURE.md §11): the column's
+    value is a JSON object / XML fragment rendered per row from the row's
+    own sibling columns — a serialization of the record, never independently
+    sampled, so the payload always agrees with the relational columns.
+
+    ``columns`` names the embedded siblings (empty = every sibling without
+    its own document spec); ``schemas`` optionally shape the payload with
+    the same JSON Schema / XSD machinery as table-level ``format``;
+    ``root`` names the XML fragment element (xml only; defaults to the
+    singularized table name).
+    """
+
+    kind: str  # "json" | "xml"
+    schemas: list[str] = field(default_factory=list)
+    columns: list[str] = field(default_factory=list)
+    root: str | None = None
+
+
+@dataclass
 class ColumnSpec:
     name: str
     type: str
@@ -85,6 +105,7 @@ class ColumnSpec:
     round: bool = False
     null_rate: float = 0.0
     reference: str | None = None  # dimension reference: name of a root table (§2)
+    document: ColumnDocumentSpec | None = None  # in-table JSON/XML payload (§11)
 
 
 @dataclass
@@ -306,6 +327,20 @@ def _parse_format(path: str, d: Any) -> FormatSpec:
     )
 
 
+def _parse_column_document(path: str, d: Any) -> ColumnDocumentSpec:
+    if not isinstance(d, dict) or "kind" not in d:
+        raise MetadataError(f"{path}: document spec must be a mapping with a 'kind'")
+    schemas = d.get("schemas")
+    if schemas is None and d.get("schema") is not None:
+        schemas = [d["schema"]]  # scalar shorthand, mirroring format.schema
+    return ColumnDocumentSpec(
+        kind=d.get("kind"),
+        schemas=list(schemas or []),
+        columns=list(d.get("columns") or []),
+        root=d.get("root"),
+    )
+
+
 def _parse_derived(path: str, d: Any) -> DerivedSpec:
     if not isinstance(d, dict):
         raise MetadataError(f"{path}: derived spec must be a mapping")
@@ -328,6 +363,10 @@ def _parse_column(path: str, cname: str, cdict: Any) -> ColumnSpec:
     if clamp is not None:
         clamp = tuple(float(x) for x in clamp)
 
+    document = None
+    if cdict.get("document") is not None:
+        document = _parse_column_document(f"{path}.document", cdict["document"])
+
     return ColumnSpec(
         name=cname,
         type=cdict.get("type"),
@@ -338,6 +377,7 @@ def _parse_column(path: str, cname: str, cdict: Any) -> ColumnSpec:
         round=bool(cdict.get("round", False)),
         null_rate=float(cdict.get("null_rate", 0.0)),
         reference=cdict.get("reference"),
+        document=document,
     )
 
 
@@ -536,6 +576,55 @@ def _validate_format(path: str, fmt: FormatSpec) -> None:
         raise MetadataError(f"{path}: root/record are only valid for kind 'xml'")
 
 
+_COLUMN_DOCUMENT_KINDS = {"json", "xml"}
+
+
+def _validate_column_document(cpath: str, t: TableSpec, cname: str, c: ColumnSpec) -> None:
+    doc = c.document
+    path = f"{cpath}.document"
+    if doc.kind not in _COLUMN_DOCUMENT_KINDS:
+        raise MetadataError(
+            f"{path}.kind: must be one of {sorted(_COLUMN_DOCUMENT_KINDS)} (got {doc.kind!r})"
+        )
+    if c.type != "string":
+        raise MetadataError(
+            f"{cpath}.type: document column must be type 'string' (got {c.type!r})"
+        )
+    for i, s in enumerate(doc.schemas):
+        if not isinstance(s, str) or not s:
+            raise MetadataError(f"{path}.schemas[{i}]: must be a non-empty path string")
+        if doc.kind == "xml":
+            if not s.lower().endswith(".xsd"):
+                raise MetadataError(
+                    f"{path}.schemas[{i}]: xml document requires .xsd schema files (got {s!r})"
+                )
+        elif not s.lower().endswith(".json"):
+            raise MetadataError(
+                f"{path}.schemas[{i}]: json document requires .json JSON Schema "
+                f"files (got {s!r})"
+            )
+    if doc.root is not None:
+        if doc.kind != "xml":
+            raise MetadataError(f"{path}.root: only valid for kind 'xml'")
+        if not isinstance(doc.root, str) or not _XML_NAME_RE.match(doc.root):
+            raise MetadataError(
+                f"{path}.root: must be a valid XML element name (got {doc.root!r})"
+            )
+    for i, name in enumerate(doc.columns):
+        epath = f"{path}.columns[{i}]"
+        if not isinstance(name, str) or not name:
+            raise MetadataError(f"{epath}: must be a non-empty column name")
+        if name == cname:
+            raise MetadataError(f"{epath}: a document column cannot embed itself")
+        embedded = t.columns.get(name)
+        if embedded is None:
+            raise MetadataError(f"{epath}: references unknown column {name!r}")
+        if embedded.document is not None:
+            raise MetadataError(
+                f"{epath}: embedded column {name!r} is itself a document column"
+            )
+
+
 def _validate_temporal(md: Metadata, tname: str, t: TableSpec) -> None:
     path = f"tables.{tname}"
     temporal_cols = {cname: c.temporal for cname, c in t.columns.items() if c.temporal is not None}
@@ -664,12 +753,17 @@ def validate(md: Metadata) -> None:
             if c.type not in _COLUMN_TYPES:
                 raise MetadataError(f"{cpath}.type: must be one of {sorted(_COLUMN_TYPES)} (got {c.type!r})")
 
-            sources = [s for s in (c.generator, c.distribution, c.temporal) if s is not None]
+            sources = [
+                s for s in (c.generator, c.distribution, c.temporal, c.document) if s is not None
+            ]
             if len(sources) != 1:
                 raise MetadataError(
-                    f"{cpath}: exactly one of generator/distribution/temporal must be set "
-                    f"(got {len(sources)})"
+                    f"{cpath}: exactly one of generator/distribution/temporal/document "
+                    f"must be set (got {len(sources)})"
                 )
+
+            if c.document is not None:
+                _validate_column_document(cpath, t, cname, c)
 
             if c.generator is not None:
                 if c.generator in ("key", "parent_key"):
@@ -832,6 +926,17 @@ def _format_spec_to_dict(fmt: FormatSpec) -> dict[str, Any]:
     return d
 
 
+def _column_document_spec_to_dict(doc: ColumnDocumentSpec) -> dict[str, Any]:
+    d: dict[str, Any] = {"kind": doc.kind}
+    if doc.schemas:
+        d["schemas"] = list(doc.schemas)
+    if doc.columns:
+        d["columns"] = list(doc.columns)
+    if doc.root is not None:
+        d["root"] = doc.root
+    return d
+
+
 def _column_spec_to_dict(col: ColumnSpec) -> dict[str, Any]:
     d: dict[str, Any] = {"type": col.type}
     if col.generator is not None:
@@ -840,6 +945,8 @@ def _column_spec_to_dict(col: ColumnSpec) -> dict[str, Any]:
         d["distribution"] = _distribution_spec_to_dict(col.distribution)
     if col.temporal is not None:
         d["temporal"] = _temporal_spec_to_dict(col.temporal)
+    if col.document is not None:
+        d["document"] = _column_document_spec_to_dict(col.document)
     if col.clamp is not None:
         d["clamp"] = [col.clamp[0], col.clamp[1]]
     if col.round:

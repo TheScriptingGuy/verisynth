@@ -12,12 +12,18 @@ scan`` prints it directly.
 
 Detection is heuristic and advisory: nothing here mutates data, and every
 finding carries the evidence (coverage, counts) so a human can veto it.
+Every loaded frame is also post-processed by ``_expand_document_columns``,
+which sniffs and flattens string columns holding a JSON object or XML
+fragment per row (the scan-side counterpart of the metadata ``document:``
+column spec) before profiling.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -119,7 +125,25 @@ def _load_frames(input_dir: str | Path) -> dict[str, pl.DataFrame]:
             f"scan: no .parquet, .csv, .json/.jsonl/.ndjson or .xml data files "
             f"(or {{table}}/ xml subdirectories) found in {p}"
         )
-    return frames
+    # In-table document columns (a string column storing a JSON object / XML
+    # fragment per row) apply to every input format alike -- expand them
+    # after loading, regardless of how the frame reached us.
+    return {name: _expand_document_columns(df) for name, df in frames.items()}
+
+
+def _rescue_datetime_strings(df: pl.DataFrame) -> pl.DataFrame:
+    """Rescue string columns that parse cleanly as ISO-8601 (T-separated)
+    datetimes into ``pl.Datetime``, mirroring ``read_csv``'s
+    ``try_parse_dates``. Shared by ``_load_json`` (DuckDB's sniffer leaves
+    T-separated timestamps as VARCHAR) and ``_expand_document_columns``'s
+    JSON payload expansion (§11)."""
+    for c in df.columns:
+        if df[c].dtype == pl.String:
+            try:
+                df = df.with_columns(df[c].str.to_datetime(time_unit="us"))
+            except pl.exceptions.PolarsError:
+                pass
+    return df
 
 
 def _load_json(path: Path) -> pl.DataFrame:
@@ -139,13 +163,7 @@ def _load_json(path: Path) -> pl.DataFrame:
     # T-separated ISO-8601 strings (the JSON-document convention, §11) as
     # VARCHAR -- rescue string columns that parse cleanly as datetimes,
     # mirroring read_csv's try_parse_dates.
-    for c in df.columns:
-        if df[c].dtype == pl.String:
-            try:
-                df = df.with_columns(df[c].str.to_datetime(time_unit="us"))
-            except pl.exceptions.PolarsError:
-                pass
-    return df
+    return _rescue_datetime_strings(df)
 
 
 def _flatten_structs(df: pl.DataFrame) -> pl.DataFrame:
@@ -202,6 +220,104 @@ def _infer_xml_column(s: pl.Series) -> pl.Series:
     except pl.exceptions.PolarsError:
         pass
     return s
+
+
+# --------------------------------------------------------------------------
+# In-table document columns (§11): a string column storing a JSON object /
+# XML fragment per row, sniffed and flattened during scan-side profiling.
+# The generation-side counterpart is the metadata ``document:`` column spec
+# (``ColumnDocumentSpec`` in metadata.py) -- fit.py's ``_expand_document_columns``
+# is the skeleton-aware fitting variant of the same idea.
+# --------------------------------------------------------------------------
+
+#: How many non-null values of a string column to sniff before deciding
+#: whether it holds a JSON object or XML fragment per row.
+_DOCUMENT_SNIFF_SAMPLE = 100
+
+
+def _looks_like_json_payload(sample: list[str]) -> bool:
+    if not sample:
+        return False
+    for v in sample:
+        s = v.strip()
+        if not s.startswith("{"):
+            return False
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(obj, dict):
+            return False
+    return True
+
+
+def _looks_like_xml_payload(sample: list[str]) -> bool:
+    if not sample:
+        return False
+    for v in sample:
+        s = v.strip()
+        if not s.startswith("<"):
+            return False
+        try:
+            ET.fromstring(s)
+        except ET.ParseError:
+            return False
+    return True
+
+
+def _merge_document_expansion(df: pl.DataFrame, payload_col: str, sub: pl.DataFrame) -> pl.DataFrame:
+    """Merge ``sub`` (one column per flattened leaf, same row order/height as
+    ``df``) into ``df``, dropping ``payload_col``. Leaf names collide with an
+    existing column (or another leaf of the same expansion) fall back to
+    ``{payload_col}_{leaf}`` -- the same convention as ``_flatten_structs``.
+    """
+    existing = set(df.columns) - {payload_col}
+    seen: set[str] = set()
+    rename: dict[str, str] = {}
+    for leaf in sub.columns:
+        new_name = leaf if leaf not in existing and leaf not in seen else f"{payload_col}_{leaf}"
+        seen.add(new_name)
+        rename[leaf] = new_name
+    sub = sub.rename(rename)
+    return df.drop(payload_col).hstack(sub)
+
+
+def _expand_json_document_column(df: pl.DataFrame, payload_col: str) -> pl.DataFrame:
+    dicts = [json.loads(v) if v is not None else None for v in df[payload_col].to_list()]
+    sub = pl.DataFrame(dicts, infer_schema_length=None)
+    sub = _flatten_structs(sub)
+    sub = _rescue_datetime_strings(sub)
+    return _merge_document_expansion(df, payload_col, sub)
+
+
+def _expand_xml_document_column(df: pl.DataFrame, payload_col: str) -> pl.DataFrame:
+    records = [
+        flatten_xml_record(ET.fromstring(v)) if v is not None else None
+        for v in df[payload_col].to_list()
+    ]
+    sub = pl.DataFrame(records, infer_schema_length=None)
+    sub = sub.with_columns(pl.all().cast(pl.String))
+    sub = sub.with_columns(_infer_xml_column(sub[c]) for c in sub.columns)
+    return _merge_document_expansion(df, payload_col, sub)
+
+
+def _expand_document_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Sniff every string column: if (up to) its first 100 non-null values
+    all parse as a JSON object or an XML fragment, expand it into flattened,
+    typed sibling columns and drop the payload column -- a unique-ish giant
+    string column would otherwise pollute PK-candidate ranking. Columns with
+    mixed/plain text (or no non-null values) are left untouched.
+    """
+    for cname in list(df.columns):
+        s = df[cname]
+        if s.dtype != pl.String:
+            continue
+        sample = s.drop_nulls().head(_DOCUMENT_SNIFF_SAMPLE).to_list()
+        if _looks_like_json_payload(sample):
+            df = _expand_json_document_column(df, cname)
+        elif _looks_like_xml_payload(sample):
+            df = _expand_xml_document_column(df, cname)
+    return df
 
 
 def _xml_scan_max_rows() -> int:

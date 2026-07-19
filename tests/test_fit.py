@@ -6,7 +6,9 @@ See docs/ARCHITECTURE.md §7 (normative) and TASK CARD 7.
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timezone
+import json
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -623,3 +625,122 @@ def test_fit_reference_column_dp_path_unnoised():
     dp_dist = dp.tables["sales"].columns["product_ref"].distribution
     assert dp_dist.kind == "zipf"
     assert dp_dist.params == no_dp_dist.params
+
+
+# --------------------------------------------------------------------------
+# In-table document columns (docs/ARCHITECTURE.md §11): fit-side expansion of
+# payload columns into skeleton-declared embedded siblings.
+# --------------------------------------------------------------------------
+
+
+def _doc_fit_skeleton(kind: str) -> dict:
+    return parse_metadata(
+        {
+            "version": 1,
+            "seed": 7,
+            "tables": {
+                "events": {
+                    "role": "root",
+                    "rows": 100,
+                    "primary_key": "event_id",
+                    "columns": {
+                        "event_id": {"type": "int64", "generator": "key"},
+                        "device": {
+                            "type": "string",
+                            "distribution": {
+                                "kind": "categorical",
+                                "categories": ["x"],
+                                "probs": [1.0],
+                            },
+                        },
+                        "signup_at": {
+                            "type": "timestamp",
+                            "distribution": {
+                                "kind": "datetime_uniform",
+                                "start": "2000-01-01T00:00:00",
+                                "end": "2000-01-02T00:00:00",
+                            },
+                        },
+                        "payload": {"type": "string", "document": {"kind": kind}},
+                    },
+                }
+            },
+        }
+    )
+
+
+def _doc_payloads(kind: str, n: int = 100) -> list[str]:
+    base = datetime(2024, 3, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+    out = []
+    for i in range(n):
+        device = "mobile" if i % 4 else "desktop"
+        at = (base + timedelta(hours=i)).isoformat()
+        if kind == "json":
+            out.append(json.dumps({"device": device, "signup_at": at}))
+        else:
+            out.append(f"<rec><device>{device}</device><signup_at>{at}</signup_at></rec>")
+    return out
+
+
+def test_fit_expands_json_document_payload():
+    skeleton = _doc_fit_skeleton("json")
+    frames = {
+        "events": pl.DataFrame(
+            {"event_id": np.arange(100, dtype=np.int64), "payload": _doc_payloads("json")}
+        )
+    }
+    fitted = fit_metadata(frames, skeleton)
+
+    dist = fitted.tables["events"].columns["device"].distribution
+    assert dist.kind == "categorical"
+    assert dist.params["categories"] == ["desktop", "mobile"]
+    assert abs(dist.params["probs"][1] - 0.75) < 1e-9
+
+    ts = fitted.tables["events"].columns["signup_at"].distribution
+    assert ts.kind == "datetime_uniform"
+    assert ts.params["start"].startswith("2024-03-01")
+
+
+def test_fit_expands_xml_document_payload():
+    skeleton = _doc_fit_skeleton("xml")
+    frames = {
+        "events": pl.DataFrame(
+            {"event_id": np.arange(100, dtype=np.int64), "payload": _doc_payloads("xml")}
+        )
+    }
+    fitted = fit_metadata(frames, skeleton)
+    dist = fitted.tables["events"].columns["device"].distribution
+    assert dist.params["categories"] == ["desktop", "mobile"]
+    ts = fitted.tables["events"].columns["signup_at"].distribution
+    assert ts.params["start"].startswith("2024-03-01")
+
+
+def test_fit_real_sibling_column_wins_over_payload():
+    skeleton = _doc_fit_skeleton("json")
+    frames = {
+        "events": pl.DataFrame(
+            {
+                "event_id": np.arange(100, dtype=np.int64),
+                # Payload says mobile/desktop, but the real column is present
+                # and says tablet -- the real column must win.
+                "device": ["tablet"] * 100,
+                "payload": _doc_payloads("json"),
+            }
+        )
+    }
+    fitted = fit_metadata(frames, skeleton)
+    dist = fitted.tables["events"].columns["device"].distribution
+    assert dist.params["categories"] == ["tablet"]
+
+
+def test_fit_malformed_payload_raises():
+    skeleton = _doc_fit_skeleton("json")
+    payloads = _doc_payloads("json")
+    payloads[3] = "{broken"
+    frames = {
+        "events": pl.DataFrame(
+            {"event_id": np.arange(100, dtype=np.int64), "payload": payloads}
+        )
+    }
+    with pytest.raises(ValueError, match="events.payload"):
+        fit_metadata(frames, skeleton)

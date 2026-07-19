@@ -773,3 +773,235 @@ def test_empty_table_shaped_json_document(tmp_path):
     assert records == []
 
     assert validate_documents(md, out_dir) == []
+
+
+# --------------------------------------------------------------------------
+# 10. In-table document columns (docs/ARCHITECTURE.md §11): a column whose
+# per-row value is a JSON object / XML fragment rendered from the row's own
+# sibling columns.
+# --------------------------------------------------------------------------
+
+
+def _doc_column_metadata(payload_spec: dict, extra_columns: dict | None = None, rows: int = 80):
+    d = {
+        "version": 1,
+        "seed": SEED,
+        "tables": {
+            "events": {
+                "role": "root",
+                "rows": rows,
+                "primary_key": "event_id",
+                "columns": {
+                    "event_id": {"type": "int64", "generator": "key"},
+                    "amount": {
+                        "type": "float64",
+                        "distribution": {"kind": "uniform", "low": 1.0, "high": 9.0},
+                        "null_rate": 0.3,
+                    },
+                    "device": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["mobile", "desktop"],
+                            "probs": [0.6, 0.4],
+                        },
+                    },
+                    "flag": {
+                        "type": "bool",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": [False, True],
+                            "probs": [0.5, 0.5],
+                        },
+                    },
+                    "at": {
+                        "type": "timestamp",
+                        "distribution": {
+                            "kind": "datetime_uniform",
+                            "start": "2024-01-01T00:00:00",
+                            "end": "2024-06-01T00:00:00",
+                        },
+                    },
+                    "payload": {"type": "string", "document": payload_spec},
+                    **(extra_columns or {}),
+                },
+            }
+        },
+    }
+    return parse_metadata(d)
+
+
+def _generated_events(md, num_partitions: int = 2):
+    tables = []
+    for p in range(num_partitions):
+        tables.append(Engine(md, seed=SEED).generate_partition(p, num_partitions)["events"])
+    import pyarrow as pa
+
+    return pa.concat_tables(tables).to_pylist()
+
+
+def test_document_column_flat_json_agrees_with_row():
+    md = _doc_column_metadata({"kind": "json"})
+    rows = _generated_events(md)
+    assert rows
+    saw_null_amount = False
+    for row in rows:
+        cell = row["payload"]
+        assert cell is not None and "\n" not in cell
+        payload = json.loads(cell)
+        # Default embedding: every non-document sibling, declaration order.
+        assert list(payload) == ["event_id", "amount", "device", "flag", "at"]
+        assert payload["event_id"] == row["event_id"]
+        assert payload["device"] == row["device"]
+        assert payload["flag"] == row["flag"]
+        assert payload["amount"] == row["amount"]  # None -> JSON null -> None
+        if row["amount"] is None:
+            saw_null_amount = True
+        assert datetime.fromisoformat(payload["at"]) == row["at"]
+    assert saw_null_amount
+
+
+def test_document_column_explicit_subset_and_mutual_exclusion():
+    md = _doc_column_metadata(
+        {"kind": "json", "columns": ["device", "flag"]},
+        extra_columns={
+            "payload2": {"type": "string", "document": {"kind": "json"}},
+        },
+    )
+    rows = _generated_events(md, num_partitions=1)
+    for row in rows:
+        assert list(json.loads(row["payload"])) == ["device", "flag"]
+        # payload2 uses the default embedding, which excludes BOTH document
+        # columns -- never nests one payload inside another.
+        assert list(json.loads(row["payload2"])) == [
+            "event_id",
+            "amount",
+            "device",
+            "flag",
+            "at",
+        ]
+
+
+def test_document_column_flat_xml_root_and_null_omission():
+    md = _doc_column_metadata({"kind": "xml"})
+    rows = _generated_events(md)
+    for row in rows:
+        cell = row["payload"]
+        assert "\n" not in cell
+        el = ET.fromstring(cell)
+        assert el.tag == "event"  # _singular("events")
+        assert (el.find("amount") is None) == (row["amount"] is None)
+        assert el.find("device").text == row["device"]
+
+    md2 = _doc_column_metadata({"kind": "xml", "root": "evt"})
+    rows2 = _generated_events(md2, num_partitions=1)
+    assert ET.fromstring(rows2[0]["payload"]).tag == "evt"
+
+
+def test_document_column_schema_shaped_json(tmp_path):
+    common = {
+        "$id": "doccol_common.schema.json",
+        "definitions": {
+            "meta": {
+                "type": "object",
+                "properties": {
+                    "device": {"type": "string"},
+                    "flag": {"type": "boolean"},
+                },
+            }
+        },
+    }
+    primary = {
+        "type": "object",
+        "required": ["event_id"],
+        "properties": {
+            "event_id": {"type": "integer"},
+            "meta": {"$ref": "doccol_common.schema.json#/definitions/meta"},
+        },
+    }
+    (tmp_path / "doccol_common.schema.json").write_text(json.dumps(common))
+    (tmp_path / "doccol.schema.json").write_text(json.dumps(primary))
+
+    md = _doc_column_metadata(
+        {"kind": "json", "schemas": ["doccol.schema.json", "doccol_common.schema.json"]}
+    )
+    md.base_dir = tmp_path
+    rows = _generated_events(md, num_partitions=1)
+    for row in rows:
+        payload = json.loads(row["payload"])
+        assert payload["event_id"] == row["event_id"]
+        assert payload["meta"] == {"device": row["device"], "flag": row["flag"]}
+
+
+def test_document_column_schema_missing_required_raises(tmp_path):
+    (tmp_path / "bad.schema.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "required": ["nope"],
+                "properties": {"nope": {"type": "string"}},
+            }
+        )
+    )
+    md = _doc_column_metadata({"kind": "json", "schemas": ["bad.schema.json"]})
+    md.base_dir = tmp_path
+    with pytest.raises(DocumentError, match="nope"):
+        Engine(md, seed=SEED).generate_partition(0, 1)
+
+
+def test_document_column_xsd_shaped(tmp_path):
+    (tmp_path / "doccol_common.xsd").write_text(
+        """<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="MetaType">
+    <xs:sequence>
+      <xs:element name="device" type="xs:string"/>
+      <xs:element name="flag" type="xs:boolean"/>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>"""
+    )
+    (tmp_path / "doccol.xsd").write_text(
+        """<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:include schemaLocation="doccol_common.xsd"/>
+  <xs:element name="event">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="event_id" type="xs:long"/>
+        <xs:element name="meta" type="MetaType"/>
+        <xs:element name="amount" type="xs:double" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"""
+    )
+    md = _doc_column_metadata(
+        {"kind": "xml", "root": "event", "schemas": ["doccol.xsd", "doccol_common.xsd"]}
+    )
+    md.base_dir = tmp_path
+    rows = _generated_events(md, num_partitions=1)
+    for row in rows:
+        el = ET.fromstring(row["payload"])
+        expected = ["event_id", "meta"] + ([] if row["amount"] is None else ["amount"])
+        assert [c.tag for c in el] == expected
+        assert [c.tag for c in el.find("meta")] == ["device", "flag"]
+        assert int(el.find("event_id").text) == row["event_id"]
+
+
+def test_document_column_null_rate():
+    md = _doc_column_metadata({"kind": "json"}, rows=400)
+    md.tables["events"].columns["payload"].null_rate = 0.3
+    rows = _generated_events(md)
+    frac = sum(1 for r in rows if r["payload"] is None) / len(rows)
+    assert abs(frac - 0.3) < 0.1
+    assert any(r["payload"] is not None for r in rows)
+
+
+def test_document_column_partition_consistency():
+    import pyarrow as pa
+
+    md = _doc_column_metadata({"kind": "json"})
+    single = Engine(md, seed=SEED).generate_partition(0, 1)["events"]
+    parts = [Engine(md, seed=SEED).generate_partition(p, 3)["events"] for p in range(3)]
+    assert pa.concat_tables(parts).equals(single)

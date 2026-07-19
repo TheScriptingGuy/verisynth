@@ -137,6 +137,7 @@ Also rendered as a JSON document file shaped by `schemas/web_order.schema.json`,
 - **placed_at** (timestamp): inherited from `orders.order_purchase_timestamp` (master data — always identical to the parent's value)
 - **device** (string): mostly mobile (62.3%), desktop (32.7%), tablet (5.0%) (3 categories)
 - **utm_source** (string): mostly direct (39.9%), google (35.0%), social (15.4%) (4 categories) and 1 more
+- **payload** (string): a JSON object rendered per row from `order_id`, `status`, `placed_at`, `device`, `utm_source` — always consistent with those columns
 
 ## Source: edi
 
@@ -152,6 +153,7 @@ Also rendered as an XML document file shaped by `schemas/edi_shipment.xsd`, `sch
 - **warehouse** (string): inherited from `inv_shipments.warehouse` (master data — always identical to the parent's value)
 - **carrier** (string): inherited from `inv_shipments.carrier` (master data — always identical to the parent's value)
 - **dispatched_at** (timestamp): inherited from `inv_shipments.handed_over_at` (master data — always identical to the parent's value)
+- **message** (string): a XML fragment rendered per row from `edi_message_id`, `shipment_id`, `service_level`, `warehouse`, `carrier`, `dispatched_at` (shaped by `schemas/edi_shipment.xsd`, `schemas/edi_common.xsd`) — always consistent with those columns
 
 ## Privacy
 

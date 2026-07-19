@@ -38,6 +38,11 @@ byte-identical regardless of partition count.
   byte-identical for any partition count; `verisynth validate` checks them, and
   the scanner accepts `.json`/`.jsonl`/`.xml` input files too. See the `web`
   (JSON) and `edi` (XML) sources in `examples/olist/`.
+- **In-table document columns**: a column-level `document:` block renders a
+  JSON object or XML fragment *per row* from the row's own sibling columns —
+  the payload always agrees with the relational columns by construction —
+  while the scanner and `fit` see through such payload columns in real data
+  (flattening them for profiling, extracting embedded attributes for fitting).
 - **XML at scale**: reading and writing stream with O(batch) memory — single
   XML files up to multiple GB work on ordinary hardware, and
   `verisynth ingest` batch-ingests directories of 100k+ XML files into a

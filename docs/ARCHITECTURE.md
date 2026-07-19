@@ -489,6 +489,24 @@ O(batch) even for multi-GB document files. For very large tables prefer
 `kind: jsonl` — a single multi-GB JSON *array* is written fine but is
 awkward for downstream consumers.
 
+**In-table document columns** are the second route: real systems often
+store a JSON object or XML fragment *per row* in a string column
+(payload/body/message). A column-level `document:` block —
+`{kind: json|xml, columns?, schemas?, root?}` — makes the column's value a
+per-row rendering of the row's OWN sibling columns (`columns:` selects
+them; default is every sibling without a document spec). The payload is a
+**serialization of the record, never independently sampled**, so it agrees
+with the relational columns cell-for-cell by construction. The same JSON
+Schema / XSD machinery shapes nested payloads; XML fragments use
+`root:` as the element name (default: singularized table name) and are
+written compact (single-line cell values). The read side mirrors this:
+the **scanner** detects string columns whose values parse as JSON objects
+/ XML elements and flattens them into typed leaf columns for profiling
+(dropping the raw payload from PK ranking), and **fit** extracts embedded
+attributes from payload columns when the skeleton declares them as
+siblings of a `document:` column but the real frame carries only the
+payload.
+
 ## 12. Streaming XML & batch ingestion (`verisynth/xmlstream.py`)
 
 XML at scale — single files up to multiple GB, and batches of 100k+ files —

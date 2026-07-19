@@ -349,6 +349,107 @@ def test_xml_scan_row_cap(tmp_path, monkeypatch):
     assert report.tables["shipments"].rows == 50
 
 
+# --------------------------------------------------------------------------
+# In-table document columns (§11): scan-side expansion.
+# --------------------------------------------------------------------------
+
+
+def test_json_payload_column_expansion(tmp_path):
+    n = 30
+    rows = []
+    for i in range(n):
+        payload = None
+        if i % 5 != 0:  # some null payload rows
+            payload = json.dumps(
+                {
+                    "event": "click" if i % 2 == 0 else "view",
+                    "created_at": f"2023-01-{(i % 28) + 1:02d}T00:00:00",
+                    "device": {
+                        "os": "ios" if i % 2 == 0 else "android",
+                        "utm": {"source": "ads"},
+                    },
+                }
+            )
+        rows.append({"event_id": i, "payload": payload})
+    pl.DataFrame(rows).write_parquet(tmp_path / "events.parquet")
+
+    report = scan_directory(tmp_path)
+    events = report.tables["events"]
+
+    assert events.pk == "event_id"
+    assert "payload" not in events.columns
+
+    assert events.columns["event"].type == "string"
+    assert events.columns["created_at"].type == "timestamp"
+    assert events.columns["os"].type == "string"
+    assert events.columns["source"].type == "string"
+
+    null_rows = sum(1 for i in range(n) if i % 5 == 0)
+    expected_null_rate = round(null_rows / n, 6)
+    assert events.columns["event"].null_rate == expected_null_rate
+    assert events.columns["created_at"].null_rate == expected_null_rate
+    assert events.columns["os"].null_rate == expected_null_rate
+    assert events.columns["source"].null_rate == expected_null_rate
+
+
+def test_xml_payload_column_expansion(tmp_path):
+    n = 20
+    payloads = []
+    for i in range(n):
+        rec = ET.Element("event")
+        ET.SubElement(rec, "kind").text = "click" if i % 2 == 0 else "view"
+        device = ET.SubElement(rec, "device")
+        ET.SubElement(device, "os").text = "ios" if i % 2 == 0 else "android"
+        if i % 3 == 0:  # optional element -> missing in most records
+            ET.SubElement(device, "model").text = "X1"
+        payloads.append(ET.tostring(rec, encoding="unicode"))
+
+    pl.DataFrame(
+        {"event_id": np.arange(n, dtype=np.int64), "payload": payloads}
+    ).write_parquet(tmp_path / "events.parquet")
+
+    report = scan_directory(tmp_path)
+    events = report.tables["events"]
+
+    assert events.pk == "event_id"
+    assert "payload" not in events.columns
+    assert events.columns["kind"].type == "string"
+    assert events.columns["os"].type == "string"
+    assert events.columns["model"].null_rate > 0
+
+
+def test_plain_text_column_not_expanded(tmp_path):
+    # Some values start with '{' but aren't (all) valid JSON objects -- must
+    # be left alone, not treated as a document payload column.
+    notes = [(f"{{not json {i}" if i % 3 == 0 else f"hello there {i}") for i in range(10)]
+    pl.DataFrame(
+        {"thing_id": np.arange(10, dtype=np.int64), "note": notes}
+    ).write_parquet(tmp_path / "things.parquet")
+
+    report = scan_directory(tmp_path)
+    things = report.tables["things"]
+    assert "note" in things.columns
+    assert things.columns["note"].type == "string"
+    assert things.columns["note"].n_unique == 10
+
+
+def test_json_payload_collision_with_existing_column(tmp_path):
+    n = 10
+    payloads = [json.dumps({"thing_id": i, "value": i * 2}) for i in range(n)]
+    pl.DataFrame(
+        {"thing_id": np.arange(n, dtype=np.int64), "payload": payloads}
+    ).write_parquet(tmp_path / "things.parquet")
+
+    report = scan_directory(tmp_path)
+    things = report.tables["things"]
+
+    assert "payload" not in things.columns
+    assert "thing_id" in things.columns  # original column untouched
+    assert things.columns["thing_id"].unique
+    assert "payload_thing_id" in things.columns  # colliding leaf, prefixed
+    assert "value" in things.columns
+
+
 def test_mixed_directory_loading(tmp_path):
     pl.DataFrame({"widget_id": np.arange(5, dtype=np.int64), "name": ["a", "b", "c", "d", "e"]}).write_parquet(
         tmp_path / "widgets.parquet"

@@ -209,6 +209,21 @@ def _describe_column(table: TableSpec, cname: str) -> str:
             )
         return f"generator: {col.generator}"
 
+    if col.document is not None:
+        doc = col.document
+        kind_name = "JSON object" if doc.kind == "json" else "XML fragment"
+        embedded = doc.columns or [
+            n for n, cc in table.columns.items() if n != cname and cc.document is None
+        ]
+        names = ", ".join(f"`{n}`" for n in embedded)
+        desc = f"a {kind_name} rendered per row from {names}"
+        if doc.schemas:
+            desc += " (shaped by " + ", ".join(f"`{s}`" for s in doc.schemas) + ")"
+        desc += " — always consistent with those columns"
+        if col.null_rate:
+            desc += f" ; {col.null_rate:.1%} null"
+        return desc
+
     if col.reference is not None:
         desc = describe_distribution(col.distribution) if col.distribution else ""
         return f"reference into `{col.reference}` — {desc}"

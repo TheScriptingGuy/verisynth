@@ -263,6 +263,15 @@ tables:
       utm_source:
         type: string
         distribution: {kind: categorical, categories: [direct, google], probs: [0.5, 0.5]}
+      # In-table document column (docs/ARCHITECTURE.md §11): the event
+      # payload the storefront would store alongside the row -- a compact
+      # JSON object rendered per row from the named sibling columns, so it
+      # can never disagree with them.
+      payload:
+        type: string
+        document:
+          kind: json
+          columns: [order_id, status, placed_at, device, utm_source]
   # --- EDI source: one shipment-notification message per inventory shipment
   # order, rendered as an XSD-shaped XML document (docs/ARCHITECTURE.md §11).
   # warehouse/carrier/dispatched_at are inherited from inv_shipments, so the
@@ -291,3 +300,13 @@ tables:
       warehouse: {type: string, generator: "parent:warehouse"}
       carrier: {type: string, generator: "parent:carrier"}
       dispatched_at: {type: timestamp, generator: "parent:handed_over_at"}
+      # In-table document column: the raw EDI message stored per row, shaped
+      # by the same XSDs as the edi_shipments.xml export file (default
+      # embedding = every non-document sibling, which is exactly the
+      # <shipment> element's XSD sequence incl. the nested <routing>).
+      message:
+        type: string
+        document:
+          kind: xml
+          root: shipment
+          schemas: [schemas/edi_shipment.xsd, schemas/edi_common.xsd]

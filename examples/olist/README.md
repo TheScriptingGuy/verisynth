@@ -264,6 +264,27 @@ Two further sources exist only as **document exports** (docs/ARCHITECTURE.md
   bare `format: {kind: jsonl}` renders the flat JSON Lines feed
   `crm/crm_tickets.jsonl` with one object per row, no schema involved.
 
+Both document sources also carry **in-table document columns**
+(docs/ARCHITECTURE.md §11) — the second JSON/XML route, for systems that
+store a payload *per row* in a string column rather than (or in addition
+to) exporting files:
+
+- `web_orders.payload` is a compact JSON object rendered per row from
+  `order_id`/`status`/`placed_at`/`device`/`utm_source` (an explicit
+  `columns:` subset), like the raw event body a storefront keeps next to
+  the parsed columns.
+- `edi_shipments.message` is the raw `<shipment>` EDI message stored per
+  row, shaped by the **same XSDs** as the `edi_shipments.xml` export file
+  (default embedding — every non-document sibling — which is exactly the
+  XSD sequence, nested `<routing>` included).
+
+Payload cells are *serializations of the row*, never independently
+sampled, so they agree with the relational columns cell-for-cell by
+construction. The read side works too: `verisynth scan` over a directory
+containing such tables flattens payload columns into typed leaf columns
+for profiling, and `verisynth fit` extracts embedded attributes from
+payload values when the real data carries only the payload.
+
 Documents are rendered from the canonical Parquet partitions with DuckDB,
 ordered by primary key, so each file is byte-identical for any
 `--partitions` count. `verisynth validate` checks that every declared

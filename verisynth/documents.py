@@ -24,6 +24,20 @@ recommended document kind: it streams one compact record per line with no
 surrounding array, which is friendlier to downstream consumers than a single
 multi-GB JSON array -- though the ``json`` array kind is still written
 streamingly and remains byte-identical to a non-streaming ``json.dump``.
+
+In-table **document columns** (``ColumnSpec.document``, docs/ARCHITECTURE.md
+§11) are a different, complementary feature: a column whose per-row string
+value is a JSON object or XML fragment serialized from that *same row's*
+other columns, rather than a separately rendered per-table file. Generation
+lives in ``compile_column_document``, called from ``Engine.generate_partition``:
+it compiles the column's ``document`` spec (embedded sibling columns, optional
+JSON Schema / XSD shaping) once into a per-row renderer function, reusing the
+same schema-shaping machinery (``_compile_json_record_schema``,
+``_compile_xsd_record``, ...) as table-level ``format``. The payload is
+always a serialization of sibling columns already sampled elsewhere -- it is
+never independently sampled -- so it stays in agreement with the relational
+columns by construction, and rendering it costs no extra RNG draws beyond
+the column's own ``null_rate`` mask.
 """
 
 from __future__ import annotations
@@ -33,12 +47,12 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import duckdb
 
 from .backbone import ParquetBackbone
-from .metadata import FormatSpec, Metadata, TableSpec
+from .metadata import ColumnDocumentSpec, FormatSpec, Metadata, TableSpec
 from .xmlstream import count_xml_records
 
 _XS = "{http://www.w3.org/2001/XMLSchema}"
@@ -269,11 +283,11 @@ def _compile_json_node(
 
 
 def _compile_json_record_schema(
-    fmt: FormatSpec, base_dir: Path | None, tname: str, columns: set[str]
+    schemas: list[str], base_dir: Path | None, tname: str, columns: set[str]
 ) -> "_LeafPlan | _ObjectPlan":
     store: dict[str, Any] = {}
     primary_doc: Any = None
-    for i, s in enumerate(fmt.schemas):
+    for i, s in enumerate(schemas):
         spath = _resolve_schema_path(base_dir, s, tname)
         with open(spath) as f:
             doc = json.load(f)
@@ -331,7 +345,9 @@ def _render_json_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path)
     col_names, first_batch = next(batches)
     # Compile (and raise on unresolvable schema properties) before opening
     # the output file, matching the old fetch-then-compile-then-write order.
-    plan = _compile_json_record_schema(t.format, metadata.base_dir, t.name, set(col_names))
+    plan = _compile_json_record_schema(
+        t.format.schemas, metadata.base_dir, t.name, set(col_names)
+    )
 
     def _all_batches() -> Iterator[list[tuple]]:
         yield first_batch
@@ -682,6 +698,120 @@ def _render_xml_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path) 
                     yield rec_el
 
     _write_xml_stream(root_name, _records(), path)
+
+
+# --------------------------------------------------------------------------
+# In-table document columns (docs/ARCHITECTURE.md §11): a column whose per-row
+# value is a JSON object / XML fragment rendered from that row's own sibling
+# columns. See the module docstring for the design rationale.
+# --------------------------------------------------------------------------
+
+
+def _resolve_document_columns(t: TableSpec, cname: str) -> list[str]:
+    """The embedded sibling column names for document column ``cname``, in
+    the order they should appear in the rendered payload.
+
+    Explicit ``document.columns`` is honored verbatim; the empty-list DEFAULT
+    is every sibling column with no ``document`` spec of its own, in table
+    declaration order, excluding ``cname`` itself.
+    """
+    spec = t.columns[cname].document
+    if spec.columns:
+        return list(spec.columns)
+    return [
+        name
+        for name, c in t.columns.items()
+        if name != cname and c.document is None
+    ]
+
+
+def _resolve_document_record_element(
+    spec: ColumnDocumentSpec,
+    t: TableSpec,
+    elements: dict[str, ET.Element],
+    complex_types: dict[str, ET.Element],
+) -> ET.Element:
+    """Resolve the XSD global element that shapes a document column's
+    payload fragment.
+
+    If ``spec.root`` names a global element directly, that element *is* the
+    record (unlike table-level ``format.root``, a document column's XML
+    fragment is never a repeated-wrapper list, so no "unbounded particle"
+    unwrapping applies here). Otherwise fall back to the same
+    wrapper/unique-global-element discovery ``_find_record_element`` uses for
+    table-level documents, with candidate name ``spec.root or
+    _singular(t.name)`` -- expressed as a small shim ``FormatSpec`` so the
+    discovery logic itself is not duplicated.
+    """
+    if spec.root is not None:
+        el = elements.get(spec.root)
+        if el is not None:
+            return el
+    candidate = spec.root or _singular(t.name)
+    shim_fmt = FormatSpec(kind="xml", root=candidate)
+    record_el, _wrapper_name = _find_record_element(shim_fmt, t, elements, complex_types)
+    return record_el
+
+
+def compile_column_document(
+    metadata: Metadata, t: TableSpec, cname: str
+) -> Callable[[dict[str, Any]], str]:
+    """Compile the ``document`` spec of column ``cname`` into a per-row
+    renderer: ``row`` (embedded column name -> python value: int/float/bool/
+    str/datetime/None) -> document string.
+
+    Schema compilation (when ``document.schemas`` is set) happens eagerly,
+    here, so an unresolvable schema surfaces as a ``DocumentError`` at compile
+    time rather than on the first rendered row.
+    """
+    spec = t.columns[cname].document
+    embedded = _resolve_document_columns(t, cname)
+
+    if spec.kind == "json":
+        if spec.schemas:
+            plan = _compile_json_record_schema(
+                spec.schemas, metadata.base_dir, t.name, set(embedded)
+            )
+
+            def _render_json(row: dict[str, Any]) -> str:
+                _, record = _shape_json_node(plan, row)
+                return json.dumps(record, separators=(",", ":"))
+
+            return _render_json
+
+        def _render_json_plain_row(row: dict[str, Any]) -> str:
+            record = {c: _coerce_json_scalar(row.get(c), None) for c in embedded}
+            return json.dumps(record, separators=(",", ":"))
+
+        return _render_json_plain_row
+
+    # kind == "xml"
+    if spec.schemas:
+        shim_fmt = FormatSpec(kind="xml", schemas=spec.schemas)
+        roots = _load_xsd_documents(shim_fmt, metadata.base_dir, t.name)
+        elements, complex_types = _collect_xsd_globals(roots)
+        record_el = _resolve_document_record_element(spec, t, elements, complex_types)
+        plan = _compile_xsd_record(record_el, elements, complex_types, t.name, set(embedded))
+
+        def _render_xml_shaped_row(row: dict[str, Any]) -> str:
+            el = _render_xsd_node(plan, row)
+            return ET.tostring(el, encoding="unicode")
+
+        return _render_xml_shaped_row
+
+    root_name = spec.root or _singular(t.name)
+
+    def _render_xml_plain_row(row: dict[str, Any]) -> str:
+        el = ET.Element(root_name)
+        for c in embedded:
+            value = row.get(c)
+            if value is None:
+                continue
+            child = ET.SubElement(el, c)
+            child.text = _xml_text(value)
+        return ET.tostring(el, encoding="unicode")
+
+    return _render_xml_plain_row
 
 
 # --------------------------------------------------------------------------
