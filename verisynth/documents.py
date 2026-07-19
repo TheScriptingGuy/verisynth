@@ -52,7 +52,7 @@ from typing import Any, Callable, Iterator
 import duckdb
 
 from .backbone import ParquetBackbone
-from .metadata import ColumnDocumentSpec, FormatSpec, Metadata, TableSpec
+from .metadata import ColumnDocumentSpec, FormatSpec, Metadata, NestSpec, TableSpec
 from .xmlstream import count_xml_records
 
 _XS = "{http://www.w3.org/2001/XMLSchema}"
@@ -100,10 +100,80 @@ def _resolve_schema_path(base_dir: Path | None, s: str, tname: str) -> Path:
 # --------------------------------------------------------------------------
 
 
+def _q(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _child_fk_column(child: TableSpec) -> str:
+    return next(cn for cn, c in child.columns.items() if c.generator == "parent_key")
+
+
+def _nest_alias(n: NestSpec) -> str:
+    return n.alias or n.table
+
+
+def _nest_columns(md: Metadata, n: NestSpec) -> list[str]:
+    """Embedded child columns for a nest entry: explicit list, or every
+    child column except its ``parent_key`` link (redundant inside the
+    parent's record)."""
+    child = md.tables[n.table]
+    if n.columns:
+        return list(n.columns)
+    fk = _child_fk_column(child)
+    return [cn for cn in child.columns if cn != fk]
+
+
+def _nest_bindings(md: Metadata, nests: list[NestSpec]) -> dict[str, tuple[set[str], dict]]:
+    """alias -> (child scalar column set, sub-bindings) for schema compilation."""
+    return {
+        _nest_alias(n): (set(_nest_columns(md, n)), _nest_bindings(md, n.nest))
+        for n in nests
+    }
+
+
+def _nested_child_subquery(md: Metadata, backbone: ParquetBackbone, n: NestSpec) -> str:
+    """Aggregate a nest entry's child rows into one ordered list of structs
+    per referenced parent key (column ``__list``, keyed by ``__fk``)."""
+    child = md.tables[n.table]
+    fk = _child_fk_column(child)
+    inner = _nested_select_sql(md, backbone, child, n.nest)
+    fields = [f"{_q(c)} := c.{_q(c)}" for c in _nest_columns(md, n)]
+    fields += [f"{_q(_nest_alias(sub))} := c.{_q(_nest_alias(sub))}" for sub in n.nest]
+    return (
+        f"SELECT {_q(fk)} AS __fk, "
+        f"list(struct_pack({', '.join(fields)}) ORDER BY c.{_q(child.primary_key)}) AS __list "
+        f"FROM ({inner}) c GROUP BY {_q(fk)}"
+    )
+
+
+def _nested_select_sql(
+    md: Metadata, backbone: ParquetBackbone, t: TableSpec, nests: list[NestSpec]
+) -> str:
+    """SELECT over ``t``'s partitions with one list-of-structs column per
+    nest entry appended (empty list for childless parents), ordered by
+    primary key — DuckDB does all the relational grouping out-of-core."""
+    glob = backbone.table_glob(t.name, t.source)
+    base = f"SELECT * FROM read_parquet('{glob}')"
+    if not nests:
+        return f"{base} ORDER BY {_q(t.primary_key)}"
+    select_cols = ["p.*"]
+    joins = []
+    for i, n in enumerate(nests):
+        sub = _nested_child_subquery(md, backbone, n)
+        joins.append(f"LEFT JOIN ({sub}) n{i} ON p.{_q(t.primary_key)} = n{i}.__fk")
+        select_cols.append(f"coalesce(n{i}.__list, []) AS {_q(_nest_alias(n))}")
+    return (
+        f"SELECT {', '.join(select_cols)} FROM ({base}) p "
+        + " ".join(joins)
+        + f" ORDER BY p.{_q(t.primary_key)}"
+    )
+
+
 def _iter_row_batches(
-    glob: str, pk: str, batch_rows: int = DEFAULT_FETCH_ROWS
+    sql: str, batch_rows: int = DEFAULT_FETCH_ROWS
 ) -> Iterator[tuple[list[str], list[tuple]]]:
-    """Stream ``(col_names, rows_batch)`` tuples with O(batch) memory.
+    """Stream ``(col_names, rows_batch)`` tuples for ``sql`` with O(batch)
+    memory (nested list-of-struct columns arrive as Python lists of dicts).
 
     The DuckDB connection stays open across iteration and is closed in
     ``finally`` whether the generator runs to completion or is abandoned
@@ -116,7 +186,7 @@ def _iter_row_batches(
     """
     con = duckdb.connect()
     try:
-        result = con.execute(f"SELECT * FROM read_parquet('{glob}') ORDER BY {pk}")
+        result = con.execute(sql)
         col_names = [d[0] for d in result.description]
         yielded_any = False
         while True:
@@ -148,14 +218,16 @@ def _singular(name: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def _render_json_plain(t: TableSpec, glob: str, path: Path) -> None:
+def _render_json_plain(
+    metadata: Metadata, backbone: ParquetBackbone, t: TableSpec, path: Path
+) -> None:
+    # Nested child collections (format.nest) ride along natively: DuckDB
+    # serializes the aggregated list-of-struct columns as JSON arrays.
+    sql = _nested_select_sql(metadata, backbone, t, t.format.nest)
     array_opt = ", ARRAY true" if t.format.kind == "json" else ""
     con = duckdb.connect()
     try:
-        con.execute(
-            f"COPY (SELECT * FROM read_parquet('{glob}') ORDER BY {t.primary_key}) "
-            f"TO '{path}' (FORMAT JSON{array_opt})"
-        )
+        con.execute(f"COPY ({sql}) TO '{path}' (FORMAT JSON{array_opt})")
     finally:
         con.close()
 
@@ -245,6 +317,17 @@ def _deref_json(
     return node, doc
 
 
+@dataclass
+class _ArrayPlan:
+    """A schema ``array`` property bound to a nested child collection
+    (format.nest): the row carries a list of child-row dicts under
+    ``column``, each shaped by ``item``."""
+
+    column: str
+    required: bool
+    item: "_LeafPlan | _ObjectPlan | _ArrayPlan"
+
+
 def _compile_json_node(
     node: Any,
     doc: Any,
@@ -253,26 +336,53 @@ def _compile_json_node(
     prop_path: str,
     required: bool,
     columns: set[str],
-) -> "_LeafPlan | _ObjectPlan | None":
+    nests: dict[str, tuple[set[str], dict]] | None = None,
+) -> "_LeafPlan | _ObjectPlan | _ArrayPlan | None":
     node, doc = _deref_json(node, doc, store, tname, prop_path)
+    nests = nests or {}
+
+    pname = prop_path.rsplit(".", 1)[-1] if prop_path else prop_path
+    is_array = isinstance(node, dict) and (
+        node.get("type") == "array" or "items" in node
+    )
+    if is_array and prop_path:
+        if pname not in nests:
+            if required:
+                raise DocumentError(
+                    f"tables.{tname}.format: schema array property {prop_path!r} "
+                    "has no matching nested child (format.nest)"
+                )
+            return None
+        item_cols, sub_nests = nests[pname]
+        item_plan = _compile_json_node(
+            node.get("items", {}),
+            doc,
+            store,
+            tname,
+            f"{prop_path}[]",
+            True,
+            item_cols,
+            sub_nests,
+        )
+        return _ArrayPlan(column=pname, required=required, item=item_plan)
+
     is_object = isinstance(node, dict) and (
         "properties" in node or node.get("type") == "object"
     )
     if is_object:
         props = node.get("properties") or {}
         req_names = set(node.get("required") or [])
-        children: list[tuple[str, _LeafPlan | _ObjectPlan]] = []
-        for pname, pnode in props.items():
-            child_path = f"{prop_path}.{pname}" if prop_path else pname
-            child_required = pname in req_names
+        children: list[tuple[str, _LeafPlan | _ObjectPlan | _ArrayPlan]] = []
+        for cprop, pnode in props.items():
+            child_path = f"{prop_path}.{cprop}" if prop_path else cprop
+            child_required = cprop in req_names
             plan = _compile_json_node(
-                pnode, doc, store, tname, child_path, child_required, columns
+                pnode, doc, store, tname, child_path, child_required, columns, nests
             )
             if plan is not None:
-                children.append((pname, plan))
+                children.append((cprop, plan))
         return _ObjectPlan(required=required, children=children)
 
-    pname = prop_path.rsplit(".", 1)[-1] if prop_path else prop_path
     if pname not in columns:
         if required:
             raise DocumentError(
@@ -283,7 +393,11 @@ def _compile_json_node(
 
 
 def _compile_json_record_schema(
-    schemas: list[str], base_dir: Path | None, tname: str, columns: set[str]
+    schemas: list[str],
+    base_dir: Path | None,
+    tname: str,
+    columns: set[str],
+    nests: dict[str, tuple[set[str], dict]] | None = None,
 ) -> "_LeafPlan | _ObjectPlan":
     store: dict[str, Any] = {}
     primary_doc: Any = None
@@ -302,7 +416,9 @@ def _compile_json_record_schema(
     else:
         record_node = primary_doc
 
-    return _compile_json_node(record_node, primary_doc, store, tname, "", True, columns)
+    return _compile_json_node(
+        record_node, primary_doc, store, tname, "", True, columns, nests
+    )
 
 
 def _coerce_json_scalar(value: Any, schema_type: str | None) -> Any:
@@ -320,8 +436,11 @@ def _coerce_json_scalar(value: Any, schema_type: str | None) -> Any:
 
 
 def _shape_json_node(
-    plan: "_LeafPlan | _ObjectPlan", row: dict[str, Any]
+    plan: "_LeafPlan | _ObjectPlan | _ArrayPlan", row: dict[str, Any]
 ) -> tuple[bool, Any]:
+    if isinstance(plan, _ArrayPlan):
+        items = row.get(plan.column) or []
+        return True, [_shape_json_node(plan.item, item)[1] for item in items]
     if isinstance(plan, _LeafPlan):
         value = row.get(plan.column)
         if value is None:
@@ -340,13 +459,20 @@ def _shape_json_node(
     return True, d
 
 
-def _render_json_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path) -> None:
-    batches = _iter_row_batches(glob, t.primary_key, batch_rows=DEFAULT_FETCH_ROWS)
+def _render_json_shaped(
+    metadata: Metadata, backbone: ParquetBackbone, t: TableSpec, path: Path
+) -> None:
+    sql = _nested_select_sql(metadata, backbone, t, t.format.nest)
+    batches = _iter_row_batches(sql, batch_rows=DEFAULT_FETCH_ROWS)
     col_names, first_batch = next(batches)
     # Compile (and raise on unresolvable schema properties) before opening
     # the output file, matching the old fetch-then-compile-then-write order.
     plan = _compile_json_record_schema(
-        t.format.schemas, metadata.base_dir, t.name, set(col_names)
+        t.format.schemas,
+        metadata.base_dir,
+        t.name,
+        set(col_names),
+        _nest_bindings(metadata, t.format.nest),
     )
 
     def _all_batches() -> Iterator[list[tuple]]:
@@ -383,22 +509,42 @@ def _render_json_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path)
 # --------------------------------------------------------------------------
 
 
-def _render_xml_plain(t: TableSpec, glob: str, path: Path) -> None:
+def _append_plain_nested(parent_el: ET.Element, metadata: Metadata, n: NestSpec, items: list) -> None:
+    """Flat-XML convention for a nested child collection: a ``<{alias}>``
+    container holding one ``<{singular(alias)}>`` element per child row."""
+    alias = _nest_alias(n)
+    container = ET.SubElement(parent_el, alias)
+    item_name = _singular(alias)
+    sub_aliases = {_nest_alias(s): s for s in n.nest}
+    for item in items or []:
+        item_el = ET.SubElement(container, item_name)
+        for key, value in item.items():
+            if key in sub_aliases:
+                _append_plain_nested(item_el, metadata, sub_aliases[key], value)
+            elif value is not None:
+                child = ET.SubElement(item_el, key)
+                child.text = _xml_text(value)
+
+
+def _render_xml_plain(
+    metadata: Metadata, backbone: ParquetBackbone, t: TableSpec, path: Path
+) -> None:
     fmt = t.format
     root_name = fmt.root or t.name
     record_name = fmt.record or _singular(t.name)
+    sql = _nested_select_sql(metadata, backbone, t, fmt.nest)
+    aliases = {_nest_alias(n): n for n in fmt.nest}
 
     def _records() -> Iterator[ET.Element]:
-        for col_names, batch in _iter_row_batches(
-            glob, t.primary_key, batch_rows=DEFAULT_FETCH_ROWS
-        ):
+        for col_names, batch in _iter_row_batches(sql, batch_rows=DEFAULT_FETCH_ROWS):
             for row in batch:
                 rec_el = ET.Element(record_name)
                 for cname, value in zip(col_names, row):
-                    if value is None:
-                        continue
-                    child = ET.SubElement(rec_el, cname)
-                    child.text = _xml_text(value)
+                    if cname in aliases:
+                        _append_plain_nested(rec_el, metadata, aliases[cname], value)
+                    elif value is not None:
+                        child = ET.SubElement(rec_el, cname)
+                        child.text = _xml_text(value)
                 yield rec_el
 
     _write_xml_stream(root_name, _records(), path)
@@ -575,24 +721,57 @@ def _find_record_element(
     )
 
 
+@dataclass
+class _XArrayPlan:
+    """A repeated (or wrapped-repeated) XSD element bound to a nested child
+    collection (format.nest): the row carries a list of child-row dicts
+    under ``column``. With ``container`` set, the repeated ``item`` elements
+    sit inside a ``<container>`` element; otherwise they repeat in place."""
+
+    column: str
+    container: str | None
+    item: "_XObjectPlan"
+
+
 def _compile_xsd_sequence(
     ct: ET.Element,
     elements: dict[str, ET.Element],
     complex_types: dict[str, ET.Element],
     tname: str,
     columns: set[str],
-) -> list["_XLeafPlan | _XObjectPlan"]:
+    nests: dict[str, tuple[set[str], dict]] | None = None,
+) -> list["_XLeafPlan | _XObjectPlan | _XArrayPlan"]:
     seq = ct.find(f"{_XS}sequence")
     if seq is None:
         seq = ct.find(f"{_XS}all")
     if seq is None:
         return []
-    children: list[_XLeafPlan | _XObjectPlan] = []
+    children: list[_XLeafPlan | _XObjectPlan | _XArrayPlan] = []
     for particle_el in seq.findall(f"{_XS}element"):
-        plan = _compile_xsd_particle(particle_el, elements, complex_types, tname, columns)
+        plan = _compile_xsd_particle(
+            particle_el, elements, complex_types, tname, columns, nests
+        )
         if plan is not None:
             children.append(plan)
     return children
+
+
+def _compile_xsd_item_plan(
+    name: str,
+    item_el: ET.Element,
+    elements: dict[str, ET.Element],
+    complex_types: dict[str, ET.Element],
+    tname: str,
+    binding: tuple[set[str], dict],
+) -> _XObjectPlan:
+    item_cols, sub_nests = binding
+    ct = _xsd_complex_type_of(item_el, complex_types)
+    if ct is None:
+        raise DocumentError(
+            f"tables.{tname}.format: nested element {name!r} has no complex content to shape"
+        )
+    children = _compile_xsd_sequence(ct, elements, complex_types, tname, item_cols, sub_nests)
+    return _XObjectPlan(name=item_el.get("name") or name, required=True, children=children)
 
 
 def _compile_xsd_particle(
@@ -601,7 +780,9 @@ def _compile_xsd_particle(
     complex_types: dict[str, ET.Element],
     tname: str,
     columns: set[str],
-) -> "_XLeafPlan | _XObjectPlan | None":
+    nests: dict[str, tuple[set[str], dict]] | None = None,
+) -> "_XLeafPlan | _XObjectPlan | _XArrayPlan | None":
+    nests = nests or {}
     ref = particle_el.get("ref")
     if ref:
         target = elements.get(_local_name(ref))
@@ -618,6 +799,34 @@ def _compile_xsd_particle(
         min_occurs = particle_el.get("minOccurs", "1")
 
     required = min_occurs != "0"
+    unbounded = particle_el.get("maxOccurs") == "unbounded"
+
+    if name in nests:
+        # Bound to a nested child collection: either the element itself
+        # repeats (maxOccurs="unbounded"), or it is a container wrapping a
+        # single unbounded item element.
+        if unbounded:
+            return _XArrayPlan(
+                column=name,
+                container=None,
+                item=_compile_xsd_item_plan(
+                    name, type_source, elements, complex_types, tname, nests[name]
+                ),
+            )
+        inner = _find_unbounded_particle(type_source, elements, complex_types, tname)
+        if inner is not None:
+            return _XArrayPlan(
+                column=name,
+                container=name,
+                item=_compile_xsd_item_plan(
+                    inner.get("name"), inner, elements, complex_types, tname, nests[name]
+                ),
+            )
+        raise DocumentError(
+            f"tables.{tname}.format: element {name!r} matches a nested child but is "
+            "neither maxOccurs=\"unbounded\" nor a wrapper of a single unbounded element"
+        )
+
     ct = _xsd_complex_type_of(type_source, complex_types)
 
     if ct is None:
@@ -629,7 +838,7 @@ def _compile_xsd_particle(
             return None
         return _XLeafPlan(name=name, column=name, required=required)
 
-    children = _compile_xsd_sequence(ct, elements, complex_types, tname, columns)
+    children = _compile_xsd_sequence(ct, elements, complex_types, tname, columns, nests)
     return _XObjectPlan(name=name, required=required, children=children)
 
 
@@ -639,6 +848,7 @@ def _compile_xsd_record(
     complex_types: dict[str, ET.Element],
     tname: str,
     columns: set[str],
+    nests: dict[str, tuple[set[str], dict]] | None = None,
 ) -> _XObjectPlan:
     name = record_el.get("name")
     ct = _xsd_complex_type_of(record_el, complex_types)
@@ -646,11 +856,23 @@ def _compile_xsd_record(
         raise DocumentError(
             f"tables.{tname}.format: record element {name!r} has no complex content to shape"
         )
-    children = _compile_xsd_sequence(ct, elements, complex_types, tname, columns)
+    children = _compile_xsd_sequence(ct, elements, complex_types, tname, columns, nests)
     return _XObjectPlan(name=name, required=True, children=children)
 
 
-def _render_xsd_node(plan: "_XLeafPlan | _XObjectPlan", row: dict[str, Any]) -> ET.Element | None:
+def _render_xsd_node(
+    plan: "_XLeafPlan | _XObjectPlan | _XArrayPlan", row: dict[str, Any]
+) -> ET.Element | list[ET.Element] | None:
+    if isinstance(plan, _XArrayPlan):
+        items = row.get(plan.column) or []
+        rendered = [_render_xsd_node(plan.item, item) for item in items]
+        rendered = [el for el in rendered if el is not None]
+        if plan.container is not None:
+            container = ET.Element(plan.container)
+            container.extend(rendered)
+            return container
+        return rendered
+
     if isinstance(plan, _XLeafPlan):
         value = row.get(plan.column)
         if value is None:
@@ -663,7 +885,12 @@ def _render_xsd_node(plan: "_XLeafPlan | _XObjectPlan", row: dict[str, Any]) -> 
     any_child = False
     for child in plan.children:
         child_el = _render_xsd_node(child, row)
-        if child_el is not None:
+        if child_el is None:
+            continue
+        if isinstance(child_el, list):
+            el.extend(child_el)
+            any_child = any_child or bool(child_el)
+        else:
             el.append(child_el)
             any_child = True
     if not any_child and not plan.required:
@@ -671,18 +898,28 @@ def _render_xsd_node(plan: "_XLeafPlan | _XObjectPlan", row: dict[str, Any]) -> 
     return el
 
 
-def _render_xml_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path) -> None:
+def _render_xml_shaped(
+    metadata: Metadata, backbone: ParquetBackbone, t: TableSpec, path: Path
+) -> None:
     fmt = t.format
     roots = _load_xsd_documents(fmt, metadata.base_dir, t.name)
     elements, complex_types = _collect_xsd_globals(roots)
     record_el, wrapper_name = _find_record_element(fmt, t, elements, complex_types)
     root_name = fmt.root or wrapper_name or t.name
 
-    batches = _iter_row_batches(glob, t.primary_key, batch_rows=DEFAULT_FETCH_ROWS)
+    sql = _nested_select_sql(metadata, backbone, t, fmt.nest)
+    batches = _iter_row_batches(sql, batch_rows=DEFAULT_FETCH_ROWS)
     col_names, first_batch = next(batches)
     # Compile (and raise on unresolvable schema elements) before opening the
     # output file, matching the old fetch-then-compile-then-write order.
-    plan = _compile_xsd_record(record_el, elements, complex_types, t.name, set(col_names))
+    plan = _compile_xsd_record(
+        record_el,
+        elements,
+        complex_types,
+        t.name,
+        set(col_names),
+        _nest_bindings(metadata, fmt.nest),
+    )
 
     def _all_batches() -> Iterator[list[tuple]]:
         yield first_batch
@@ -819,18 +1056,20 @@ def compile_column_document(
 # --------------------------------------------------------------------------
 
 
-def _render_document(metadata: Metadata, t: TableSpec, glob: str, path: Path) -> None:
+def _render_document(
+    metadata: Metadata, backbone: ParquetBackbone, t: TableSpec, path: Path
+) -> None:
     fmt = t.format
     if fmt.kind in ("json", "jsonl"):
         if fmt.schemas:
-            _render_json_shaped(metadata, t, glob, path)
+            _render_json_shaped(metadata, backbone, t, path)
         else:
-            _render_json_plain(t, glob, path)
+            _render_json_plain(metadata, backbone, t, path)
     else:  # xml
         if fmt.schemas:
-            _render_xml_shaped(metadata, t, glob, path)
+            _render_xml_shaped(metadata, backbone, t, path)
         else:
-            _render_xml_plain(t, glob, path)
+            _render_xml_plain(metadata, backbone, t, path)
 
 
 def write_documents(metadata: Metadata, out_dir: str | Path) -> dict[str, Path]:
@@ -849,8 +1088,7 @@ def write_documents(metadata: Metadata, out_dir: str | Path) -> dict[str, Path]:
             continue
         path = document_path(out_dir, t)
         path.parent.mkdir(parents=True, exist_ok=True)
-        glob = backbone.table_glob(tname, t.source)
-        _render_document(metadata, t, glob, path)
+        _render_document(metadata, backbone, t, path)
         results[tname] = path
     return results
 
@@ -910,6 +1148,35 @@ def validate_documents(metadata: Metadata, out_dir: str | Path) -> list[str]:
                 violations.append(
                     f"{tname}: document {path} has {n} records, expected {expected}"
                 )
+
+            # Nested child collections: the summed nested lengths must equal
+            # the child table's Parquet row count (every child row appears
+            # exactly once under its parent). JSON kinds only — XML nested
+            # counting would need schema-aware tag walking.
+            if t.format.kind in ("json", "jsonl"):
+                for nest in t.format.nest:
+                    child = metadata.tables[nest.table]
+                    child_glob = backbone.table_glob(nest.table, child.source)
+                    alias = nest.alias or nest.table
+                    try:
+                        (child_expected,) = con.execute(
+                            f"SELECT count(*) FROM read_parquet('{child_glob}')"
+                        ).fetchone()
+                        (nested_n,) = con.execute(
+                            f"SELECT coalesce(sum(len({_q(alias)})), 0) "
+                            f"FROM read_json_auto('{path}')"
+                        ).fetchone()
+                    except Exception as e:
+                        violations.append(
+                            f"{tname}: could not count nested {alias!r} records "
+                            f"in {path}: {e}"
+                        )
+                        continue
+                    if nested_n != child_expected:
+                        violations.append(
+                            f"{tname}: document {path} nests {nested_n} {alias!r} "
+                            f"records, expected {child_expected} ({nest.table})"
+                        )
     finally:
         con.close()
 

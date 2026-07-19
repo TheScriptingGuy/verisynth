@@ -323,6 +323,11 @@ def _render_table(md: Metadata, tname: str) -> list[str]:
         if t.format.schemas:
             names = ", ".join(f"`{s}`" for s in t.format.schemas)
             sentence += f" shaped by {names}"
+        if t.format.nest:
+            nested = ", ".join(
+                f"`{n.table}` as `{n.alias or n.table}`" for n in t.format.nest
+            )
+            sentence += f", nesting {nested} inside each record"
         lines.append(sentence + ".")
         lines.append("")
 

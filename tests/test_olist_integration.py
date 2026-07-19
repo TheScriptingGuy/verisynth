@@ -727,6 +727,8 @@ def _document_paths(out_dir: Path) -> dict[str, Path]:
         "crm_tickets": out_dir / "crm" / "crm_tickets.jsonl",
         "web_orders": out_dir / "web" / "web_orders.json",
         "edi_shipments": out_dir / "edi" / "edi_shipments.xml",
+        "orders": out_dir / "shop" / "orders.json",
+        "crm_contacts": out_dir / "crm" / "crm_contacts.xml",
     }
 
 
@@ -906,6 +908,86 @@ def test_scan_sees_through_generated_payload_columns(synth_out_dir, tmp_path, fi
     # Leaf names collide with the real sibling columns, so the expansion
     # lands under the payload-prefixed fallback names.
     assert {"payload_order_id", "payload_status", "payload_device"} <= cols
+
+
+def test_orders_json_nests_items_and_payments(synth_out_dir, synth_frames):
+    """Relational nesting (format.nest): every order_items / order_payments
+    row appears exactly once inside its parent order's record, ordered by
+    child pk, with the redundant order_id link omitted."""
+    import json as json_mod
+
+    with open(_document_paths(synth_out_dir)["orders"]) as f:
+        records = json_mod.load(f)
+    assert len(records) == synth_frames["orders"].height
+
+    items = synth_frames["order_items"]
+    by_order: dict = {}
+    for row in items.sort("order_item_id").iter_rows(named=True):
+        by_order.setdefault(row["order_id"], []).append(row)
+
+    total_nested = 0
+    for rec in records:
+        nested = rec["items"]
+        expected = by_order.get(rec["order_id"], [])
+        assert [n["order_item_id"] for n in nested] == [e["order_item_id"] for e in expected]
+        for n, e in zip(nested, expected):
+            assert "order_id" not in n
+            assert n["price"] == e["price"]
+            assert n["product_id"] == e["product_id"]
+        total_nested += len(nested)
+    assert total_nested == items.height
+    assert sum(len(r["payments"]) for r in records) == synth_frames["order_payments"].height
+
+
+def test_crm_contacts_xml_nests_tickets(synth_out_dir, synth_frames):
+    """Each <contact> nests its crm_tickets rows as <tickets><ticket>...;
+    the nested rows agree with the flat crm_tickets table."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(_document_paths(synth_out_dir)["crm_contacts"]).getroot()
+    assert root.tag == "contacts"
+    assert len(root) == synth_frames["crm_contacts"].height
+
+    tickets = synth_frames["crm_tickets"]
+    by_contact: dict = {}
+    for row in tickets.sort("ticket_id").iter_rows(named=True):
+        by_contact.setdefault(row["contact_id"], []).append(row)
+
+    total = 0
+    for rec in root:
+        contact_id = int(rec.find("contact_id").text)
+        container = rec.find("tickets")
+        nested = list(container) if container is not None else []
+        expected = by_contact.get(contact_id, [])
+        assert [int(n.find("ticket_id").text) for n in nested] == [
+            e["ticket_id"] for e in expected
+        ]
+        for n, e in zip(nested, expected):
+            assert n.find("channel").text == e["channel"]
+        total += len(nested)
+    assert total == tickets.height
+
+
+def test_scan_reverses_nested_documents(synth_out_dir, tmp_path):
+    """Read-route round trip: scanning the nested orders.json recovers
+    items/payments as separate child tables related to orders."""
+    import shutil
+
+    from verisynth.scanner import scan_directory
+
+    scan_dir = tmp_path / "scan-nested"
+    scan_dir.mkdir()
+    shutil.copy(_document_paths(synth_out_dir)["orders"], scan_dir / "orders.json")
+
+    report = scan_directory(scan_dir)
+    assert {"orders", "items", "payments"} <= set(report.tables)
+    assert "items" not in report.tables["orders"].columns
+    rels = {
+        (r.child, r.parent, r.child_column)
+        for r in report.relations
+    }
+    assert ("items", "orders", "order_id") in rels
+    assert ("payments", "orders", "order_id") in rels
 
 
 def test_document_determinism_across_partitions(tmp_path, fitted_metadata, synth_out_dir):

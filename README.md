@@ -43,6 +43,12 @@ byte-identical regardless of partition count.
   the payload always agrees with the relational columns by construction —
   while the scanner and `fit` see through such payload columns in real data
   (flattening them for profiling, extracting embedded attributes for fitting).
+- **Relational nesting**: `format.nest` embeds child-table rows inside each
+  parent record — JSON arrays / repeated XML elements, recursive through
+  grandchildren, grouped out-of-core by DuckDB and bindable to JSON Schema
+  `array` properties or XSD `maxOccurs="unbounded"` particles. The scanner
+  reverses it: nested entity collections in real JSON/XML become separate
+  child tables with the 1-N relation detected.
 - **XML at scale**: reading and writing stream with O(batch) memory — single
   XML files up to multiple GB work on ordinary hardware, and
   `verisynth ingest` batch-ingests directories of 100k+ XML files into a

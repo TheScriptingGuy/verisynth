@@ -58,6 +58,22 @@ class CopulaSpec:
 
 
 @dataclass
+class NestSpec:
+    """One nested child collection inside a table's document rendering
+    (docs/ARCHITECTURE.md §11): the rows of a direct child table appear as a
+    nested array (JSON) / repeated elements (XML) under ``alias`` in each
+    parent record. ``columns`` selects the embedded child columns (default:
+    every child column except its ``parent_key`` link); ``nest`` recurses
+    into the child's own children.
+    """
+
+    table: str
+    alias: str | None = None  # YAML key: "as"; default = table name
+    columns: list[str] = field(default_factory=list)
+    nest: list["NestSpec"] = field(default_factory=list)
+
+
+@dataclass
 class FormatSpec:
     """Document rendering for a table (docs/ARCHITECTURE.md §11).
 
@@ -72,6 +88,7 @@ class FormatSpec:
     schemas: list[str] = field(default_factory=list)
     root: str | None = None
     record: str | None = None
+    nest: list[NestSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -313,6 +330,17 @@ def _parse_copula(path: str, d: Any) -> CopulaSpec:
     return CopulaSpec(name=name, columns=columns, correlation=correlation)
 
 
+def _parse_nest(path: str, d: Any) -> NestSpec:
+    if not isinstance(d, dict) or "table" not in d:
+        raise MetadataError(f"{path}: nest spec must be a mapping with a 'table'")
+    return NestSpec(
+        table=d.get("table"),
+        alias=d.get("as"),
+        columns=list(d.get("columns") or []),
+        nest=[_parse_nest(f"{path}.nest[{i}]", n) for i, n in enumerate(d.get("nest") or [])],
+    )
+
+
 def _parse_format(path: str, d: Any) -> FormatSpec:
     if not isinstance(d, dict) or "kind" not in d:
         raise MetadataError(f"{path}: format spec must be a mapping with a 'kind'")
@@ -324,6 +352,7 @@ def _parse_format(path: str, d: Any) -> FormatSpec:
         schemas=list(schemas or []),
         root=d.get("root"),
         record=d.get("record"),
+        nest=[_parse_nest(f"{path}.nest[{i}]", n) for i, n in enumerate(d.get("nest") or [])],
     )
 
 
@@ -574,6 +603,32 @@ def _validate_format(path: str, fmt: FormatSpec) -> None:
                 )
     elif fmt.root is not None or fmt.record is not None:
         raise MetadataError(f"{path}: root/record are only valid for kind 'xml'")
+
+
+def _validate_nest(md: Metadata, parent_table: str, path: str, nests: list[NestSpec]) -> None:
+    seen_aliases: set[str] = set()
+    for i, n in enumerate(nests):
+        npath = f"{path}.nest[{i}]"
+        child = md.tables.get(n.table)
+        if child is None:
+            raise MetadataError(f"{npath}.table: unknown table {n.table!r}")
+        if child.parent != parent_table:
+            raise MetadataError(
+                f"{npath}.table: {n.table!r} must be a direct child of "
+                f"{parent_table!r} (its parent is {child.parent!r})"
+            )
+        alias = n.alias or n.table
+        if not _XML_NAME_RE.match(alias):
+            raise MetadataError(f"{npath}.as: invalid nested name {alias!r}")
+        if alias in seen_aliases:
+            raise MetadataError(f"{npath}.as: duplicate nested name {alias!r}")
+        seen_aliases.add(alias)
+        for j, cname in enumerate(n.columns):
+            if cname not in child.columns:
+                raise MetadataError(
+                    f"{npath}.columns[{j}]: unknown column {cname!r} on table {n.table!r}"
+                )
+        _validate_nest(md, n.table, npath, n.nest)
 
 
 _COLUMN_DOCUMENT_KINDS = {"json", "xml"}
@@ -844,6 +899,7 @@ def validate(md: Metadata) -> None:
 
         if t.format is not None:
             _validate_format(f"{path}.format", t.format)
+            _validate_nest(md, tname, f"{path}.format", t.format.nest)
 
         seen_copula_names: set[str] = set()
         for i, cop in enumerate(t.copulas):
@@ -915,6 +971,17 @@ def _derived_spec_to_dict(der: DerivedSpec) -> dict[str, Any]:
     return {"name": der.name, "expr": der.expr}
 
 
+def _nest_spec_to_dict(n: NestSpec) -> dict[str, Any]:
+    d: dict[str, Any] = {"table": n.table}
+    if n.alias is not None:
+        d["as"] = n.alias
+    if n.columns:
+        d["columns"] = list(n.columns)
+    if n.nest:
+        d["nest"] = [_nest_spec_to_dict(x) for x in n.nest]
+    return d
+
+
 def _format_spec_to_dict(fmt: FormatSpec) -> dict[str, Any]:
     d: dict[str, Any] = {"kind": fmt.kind}
     if fmt.schemas:
@@ -923,6 +990,8 @@ def _format_spec_to_dict(fmt: FormatSpec) -> dict[str, Any]:
         d["root"] = fmt.root
     if fmt.record is not None:
         d["record"] = fmt.record
+    if fmt.nest:
+        d["nest"] = [_nest_spec_to_dict(n) for n in fmt.nest]
     return d
 
 

@@ -464,3 +464,68 @@ def test_mixed_directory_loading(tmp_path):
     assert report.tables["widgets"].pk == "widget_id"
     assert report.tables["gadgets"].pk == "gadget_id"
     assert report.tables["shipments"].pk == "shipment_id"
+
+
+# --------------------------------------------------------------------------
+# Nested entity extraction (read side of format.nest): JSON list-of-struct
+# columns and repeated XML elements become separate child tables with the
+# relation detected.
+# --------------------------------------------------------------------------
+
+
+def test_json_nested_entities_become_child_table(tmp_path):
+    records = []
+    for i in range(30):
+        records.append(
+            {
+                "order_id": i,
+                "status": "ok",
+                "lines": [
+                    {"item_id": i * 10 + j, "sku": "ab"[j % 2]} for j in range(i % 3)
+                ],
+            }
+        )
+    (tmp_path / "orders.json").write_text(json.dumps(records))
+
+    report = scan_directory(tmp_path)
+    assert set(report.tables) == {"orders", "lines"}
+    orders = report.tables["orders"]
+    assert "lines" not in orders.columns  # list column extracted, not profiled
+    lines = report.tables["lines"]
+    # Parent id injected + child fields, exploded one row per nested record.
+    assert {"order_id", "item_id", "sku"} <= set(lines.columns)
+    assert lines.rows == sum(i % 3 for i in range(30))
+    assert lines.pk == "item_id"
+    rel = [r for r in report.relations if r.child == "lines" and r.parent == "orders"]
+    assert rel and rel[0].child_column == "order_id"
+
+
+def test_xml_repeated_and_container_nested_entities(tmp_path):
+    parts = ["<orders>"]
+    for i in range(20):
+        lines = "".join(
+            f"<line><item_id>{i * 10 + j}</item_id><sku>s{j}</sku></line>"
+            for j in range(1 + i % 2)
+        )
+        parts.append(
+            f"<order><order_id>{i}</order_id><status>ok</status>"
+            f"<lines>{lines}</lines>"
+            f"<note><author>bot</author><text>t{i}</text></note>"
+            f"</order>"
+        )
+    parts.append("</orders>")
+    (tmp_path / "orders.xml").write_text("".join(parts))
+
+    report = scan_directory(tmp_path)
+    # <lines> is a container of repeated entity records -> child table;
+    # <note> is a single nested struct-like element -> flattened into the
+    # parent as scalar columns, NOT extracted.
+    assert set(report.tables) == {"orders", "lines"}
+    orders = report.tables["orders"]
+    assert {"order_id", "status", "author", "text"} <= set(orders.columns)
+    lines = report.tables["lines"]
+    assert lines.rows == sum(1 + i % 2 for i in range(20))
+    assert {"order_id", "item_id", "sku"} <= set(lines.columns)
+    assert lines.columns["item_id"].type == "int64"
+    rel = [r for r in report.relations if r.child == "lines" and r.parent == "orders"]
+    assert rel and rel[0].child_column == "order_id"

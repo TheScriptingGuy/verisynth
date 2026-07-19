@@ -1005,3 +1005,241 @@ def test_document_column_partition_consistency():
     single = Engine(md, seed=SEED).generate_partition(0, 1)["events"]
     parts = [Engine(md, seed=SEED).generate_partition(p, 3)["events"] for p in range(3)]
     assert pa.concat_tables(parts).equals(single)
+
+
+# --------------------------------------------------------------------------
+# 11. Relational nesting (format.nest): child-table rows as nested arrays /
+# repeated elements inside the parent's document.
+# --------------------------------------------------------------------------
+
+
+def _nested_metadata(fmt: dict) -> "object":
+    d = _base_metadata_dict(n_orders=40)
+    # Grandchild of items, to exercise recursive nesting.
+    d["tables"]["item_notes"] = {
+        "role": "child",
+        "parent": "items",
+        "cardinality": {"kind": "poisson", "lam": 0.8, "max": 4},
+        "child_stride": 8,
+        "primary_key": "note_id",
+        "columns": {
+            "note_id": {"type": "int64", "generator": "key"},
+            "item_id": {"type": "int64", "generator": "parent_key"},
+            "text": {
+                "type": "string",
+                "distribution": {
+                    "kind": "categorical",
+                    "categories": ["ok", "late", "damaged"],
+                    "probs": [0.6, 0.25, 0.15],
+                },
+            },
+        },
+    }
+    d["tables"]["orders"]["format"] = fmt
+    return parse_metadata(d)
+
+
+def _expected_children(out_dir, child: str, fk: str, cols: str, pk: str) -> dict:
+    glob = str(out_dir / child / "*.parquet")
+    grouped: dict = {}
+    for row in _duckdb_rows(glob, f"{fk}, {cols}", f"{fk}, {pk}"):
+        grouped.setdefault(row[0], []).append(row[1:])
+    return grouped
+
+
+def test_nested_flat_json(tmp_path):
+    md = _nested_metadata(
+        {
+            "kind": "json",
+            "nest": [
+                {"table": "items", "as": "lines", "nest": [{"table": "item_notes", "as": "notes"}]}
+            ],
+        }
+    )
+    out_dir = tmp_path / "out"
+    Engine(md, seed=SEED).generate(str(out_dir), num_partitions=2)
+
+    with open(document_path(out_dir, md.tables["orders"])) as f:
+        records = json.load(f)
+    assert len(records) == 40
+
+    by_order = _expected_children(out_dir, "items", "order_id", "item_id, sku", "item_id")
+    by_item = _expected_children(out_dir, "item_notes", "item_id", "note_id, text", "note_id")
+
+    total_items = 0
+    saw_childless = False
+    for rec in records:
+        lines = rec["lines"]
+        expected = by_order.get(rec["order_id"], [])
+        # fk column excluded by default; child pk order preserved.
+        assert [(ln["item_id"], ln["sku"]) for ln in lines] == expected
+        if not expected:
+            saw_childless = True
+            assert lines == []
+        total_items += len(lines)
+        for ln in lines:
+            assert [(nt["note_id"], nt["text"]) for nt in ln["notes"]] == by_item.get(
+                ln["item_id"], []
+            )
+            assert "order_id" not in ln  # parent_key link is redundant inside the parent
+    assert saw_childless
+    assert total_items == sum(len(v) for v in by_order.values())
+
+    assert validate_documents(md, out_dir) == []
+
+
+def test_nested_shaped_json_array_property(tmp_path):
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["order_id", "lines"],
+            "properties": {
+                "order_id": {"type": "integer"},
+                "customer": {
+                    "type": "object",
+                    "properties": {"customer_name": {"type": "string"}},
+                },
+                "lines": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["sku"],
+                        "properties": {
+                            "item_id": {"type": "integer"},
+                            "sku": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+    }
+    (tmp_path / "nested.schema.json").write_text(json.dumps(schema))
+    md = _nested_metadata(
+        {
+            "kind": "json",
+            "schemas": ["nested.schema.json"],
+            "nest": [{"table": "items", "as": "lines"}],
+        }
+    )
+    md.base_dir = tmp_path
+    out_dir = tmp_path / "out"
+    Engine(md, seed=SEED).generate(str(out_dir), num_partitions=2)
+
+    with open(document_path(out_dir, md.tables["orders"])) as f:
+        records = json.load(f)
+
+    by_order = _expected_children(out_dir, "items", "order_id", "item_id, sku", "item_id")
+    for rec in records:
+        assert set(rec) <= {"order_id", "customer", "lines"}
+        assert [(ln["item_id"], ln["sku"]) for ln in rec["lines"]] == by_order.get(
+            rec["order_id"], []
+        )
+
+
+def test_nested_shaped_json_array_without_nest_raises(tmp_path):
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["lines"],
+            "properties": {"lines": {"type": "array", "items": {"type": "object"}}},
+        },
+    }
+    (tmp_path / "bad.schema.json").write_text(json.dumps(schema))
+    md = _nested_metadata({"kind": "json", "schemas": ["bad.schema.json"]})
+    md.base_dir = tmp_path
+    with pytest.raises(DocumentError, match="no matching nested child"):
+        Engine(md, seed=SEED).generate(str(tmp_path / "out"), num_partitions=1)
+
+
+def test_nested_flat_xml(tmp_path):
+    md = _nested_metadata({"kind": "xml", "nest": [{"table": "items", "as": "lines"}]})
+    out_dir = tmp_path / "out"
+    Engine(md, seed=SEED).generate(str(out_dir), num_partitions=2)
+
+    root = ET.parse(document_path(out_dir, md.tables["orders"])).getroot()
+    by_order = _expected_children(out_dir, "items", "order_id", "item_id, sku", "item_id")
+    for rec in root:
+        order_id = int(rec.find("order_id").text)
+        container = rec.find("lines")
+        assert container is not None
+        assert all(item.tag == "line" for item in container)  # singular(alias)
+        got = [(int(i.find("item_id").text), i.find("sku").text) for i in container]
+        assert got == by_order.get(order_id, [])
+
+
+def test_nested_xsd_shaped_xml(tmp_path):
+    (tmp_path / "nested.xsd").write_text(
+        """<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="orders">
+    <xs:complexType><xs:sequence>
+      <xs:element ref="order" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence></xs:complexType>
+  </xs:element>
+  <xs:element name="order">
+    <xs:complexType><xs:sequence>
+      <xs:element name="order_id" type="xs:long"/>
+      <xs:element name="lines">
+        <xs:complexType><xs:sequence>
+          <xs:element name="line" maxOccurs="unbounded" minOccurs="0">
+            <xs:complexType><xs:sequence>
+              <xs:element name="item_id" type="xs:long"/>
+              <xs:element name="sku" type="xs:string"/>
+            </xs:sequence></xs:complexType>
+          </xs:element>
+        </xs:sequence></xs:complexType>
+      </xs:element>
+    </xs:sequence></xs:complexType>
+  </xs:element>
+</xs:schema>"""
+    )
+    md = _nested_metadata(
+        {
+            "kind": "xml",
+            "root": "orders",
+            "record": "order",
+            "schemas": ["nested.xsd"],
+            # The XSD wraps repeated <line> in <lines>; bind the container
+            # name.
+            "nest": [{"table": "items", "as": "lines"}],
+        }
+    )
+    md.base_dir = tmp_path
+    out_dir = tmp_path / "out"
+    Engine(md, seed=SEED).generate(str(out_dir), num_partitions=2)
+
+    root = ET.parse(document_path(out_dir, md.tables["orders"])).getroot()
+    by_order = _expected_children(out_dir, "items", "order_id", "item_id, sku", "item_id")
+    assert len(list(root)) == 40
+    for rec in root:
+        assert [c.tag for c in rec] == ["order_id", "lines"]
+        got = [
+            (int(i.find("item_id").text), i.find("sku").text) for i in rec.find("lines")
+        ]
+        assert got == by_order.get(int(rec.find("order_id").text), [])
+
+
+def test_nested_validation_catches_truncated_children(tmp_path):
+    md = _nested_metadata({"kind": "json", "nest": [{"table": "items"}]})
+    out_dir = tmp_path / "out"
+    Engine(md, seed=SEED).generate(str(out_dir), num_partitions=1)
+    assert validate_documents(md, out_dir) == []
+
+    p = document_path(out_dir, md.tables["orders"])
+    records = json.loads(p.read_text())
+    for rec in records:
+        rec["items"] = rec["items"][:1]
+    p.write_text(json.dumps(records))
+    assert any("nests" in v for v in validate_documents(md, out_dir))
+
+
+def test_nested_document_determinism(tmp_path):
+    md = _nested_metadata({"kind": "json", "nest": [{"table": "items", "as": "lines"}]})
+    out1, out2 = tmp_path / "a", tmp_path / "b"
+    Engine(md, seed=SEED).generate(str(out1), num_partitions=1)
+    Engine(md, seed=SEED).generate(str(out2), num_partitions=3)
+    p1 = document_path(out1, md.tables["orders"])
+    p2 = document_path(out2, md.tables["orders"])
+    assert p1.read_bytes() == p2.read_bytes()

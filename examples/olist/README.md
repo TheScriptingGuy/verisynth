@@ -285,6 +285,22 @@ containing such tables flattens payload columns into typed leaf columns
 for profiling, and `verisynth fit` extracts embedded attributes from
 payload values when the real data carries only the payload.
 
+Two exports additionally demonstrate **relational nesting**
+(`format.nest`, docs/ARCHITECTURE.md §11) — 1-N relations between tabular
+entities rendered as nested entities inside the documents:
+
+- `shop/orders.json`: each order record carries its `order_items` rows as
+  a nested `items` array and its `order_payments` rows as `payments`
+  (childless orders get `[]`; the child's `order_id` link is omitted as
+  redundant inside its parent).
+- `crm/crm_contacts.xml`: each `<contact>` nests its support tickets as
+  `<tickets><ticket>…</ticket></tickets>` — the same ticket rows that also
+  ship flat in `crm_tickets.jsonl`, agreeing by construction.
+
+Scanning those generated documents reverses the nesting: the `items` /
+`payments` arrays and the repeated `<ticket>` elements come back as
+separate child tables with the parent relation detected.
+
 Documents are rendered from the canonical Parquet partitions with DuckDB,
 ordered by primary key, so each file is byte-identical for any
 `--partitions` count. `verisynth validate` checks that every declared

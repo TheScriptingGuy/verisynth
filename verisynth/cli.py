@@ -22,7 +22,7 @@ from .engine import Engine
 from .explain import explain_metadata
 from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
-from .scanner import init_from_dir, render_report, report_to_dict, scan_directory
+from .scanner import _load_frames, init_from_dir, render_report, report_to_dict, scan_directory
 from .wizard import Chat, WizardAborted, run_wizard
 from .xmlstream import DEFAULT_BATCH_ROWS, xml_dir_to_parquet
 
@@ -65,12 +65,26 @@ def _cmd_fit(args: argparse.Namespace) -> int:
     input_dir = Path(args.input)
 
     frames: dict[str, pl.DataFrame] = {}
+    scanned: dict[str, pl.DataFrame] | None = None
     for tname in skeleton.table_order():
         path = input_dir / f"{tname}.parquet"
-        if not path.exists():
-            print(f"fit: missing input file for table {tname!r}: {path}", file=sys.stderr)
-            return 1
-        frames[tname] = pl.read_parquet(path)
+        if path.exists():
+            frames[tname] = pl.read_parquet(path)
+            continue
+        # Fallback: the scanner's loaders cover .csv/.json/.jsonl/.xml files
+        # and extract nested entity collections / payload columns into flat
+        # tables -- so a directory of nested documents can be fitted
+        # directly (XML tables are subject to VERISYNTH_XML_SCAN_ROWS).
+        if scanned is None:
+            try:
+                scanned = _load_frames(input_dir)
+            except FileNotFoundError:
+                scanned = {}
+        if tname in scanned:
+            frames[tname] = scanned[tname]
+            continue
+        print(f"fit: missing input file for table {tname!r}: {path}", file=sys.stderr)
+        return 1
 
     fitted = fit_metadata(frames, skeleton, epsilon=args.epsilon, dp_seed=args.dp_seed)
 

@@ -8,6 +8,8 @@ Deterministic generation with seed 20240817: identical output for identical meta
 
 Root entity, 25,000 rows.
 
+Also rendered as an XML document file, nesting `crm_tickets` as `tickets` inside each record.
+
 - **contact_id** (int64): primary key
 - **state** (string): mostly SP (41.7%), RJ (12.8%), MG (12.0%) (27 categories) and 24 more
 - **created_at** (timestamp): between 2015-01-01T00:43:47 and 2018-09-30T22:56:08
@@ -44,6 +46,8 @@ Child of `crm_contacts`: each crm_contacts row has one customers row with probab
 ### orders
 
 Child of `customers`: on average 1 orders rows per customers row (up to 11).
+
+Also rendered as a JSON document file, nesting `order_items` as `items`, `order_payments` as `payments` inside each record.
 
 - **order_id** (int64): primary key
 - **customer_id** (int64): reference to the `customers` row

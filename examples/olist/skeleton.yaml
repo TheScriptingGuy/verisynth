@@ -9,6 +9,17 @@ tables:
     rows: 25000
     source: crm
     primary_key: contact_id
+    # Relational nesting (docs/ARCHITECTURE.md §11): render the CRM export
+    # as XML with each contact's support tickets nested inside its record
+    # (<contact>...<tickets><ticket>...</ticket></tickets></contact>) --
+    # the 1-N relation appears as repeated child elements, and the same
+    # ticket rows are ALSO exported flat as crm_tickets.jsonl.
+    format:
+      kind: xml
+      root: contacts
+      record: contact
+      nest:
+      - {table: crm_tickets, as: tickets}
     columns:
       contact_id: {type: int64, generator: key}
       state:
@@ -80,6 +91,15 @@ tables:
     cardinality: {kind: poisson, lam: 1.0, max: 20}
     child_stride: 32
     primary_key: order_id
+    # Relational nesting: the shop's order export is a JSON array where each
+    # order record carries its line items and payments as nested arrays --
+    # DuckDB groups the child tables per order and serializes the nested
+    # JSON natively (docs/ARCHITECTURE.md §11).
+    format:
+      kind: json
+      nest:
+      - {table: order_items, as: items}
+      - {table: order_payments, as: payments}
     columns:
       order_id:    {type: int64, generator: key}
       customer_id: {type: int64, generator: parent_key}

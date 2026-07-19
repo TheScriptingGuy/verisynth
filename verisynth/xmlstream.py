@@ -105,6 +105,29 @@ def _iter_records_reference(path: str | Path) -> Iterator[dict[str, str | None]]
                     del root[:]
 
 
+def iter_xml_record_elements(path: str | Path) -> Iterator[ET.Element]:
+    """Stream the RAW record elements (direct children of the root) with
+    O(record) memory — for consumers that need the unflattened subtree, e.g.
+    the scanner's nested-entity extraction. Always uses the ElementTree
+    backend (callers cap consumption; the flattened fast path stays in
+    ``iter_xml_batches``). The yielded element is detached and cleared after
+    the consumer's iteration step, so it must not be retained."""
+    root: ET.Element | None = None
+    depth = 0
+    for event, elem in ET.iterparse(str(path), events=("start", "end")):
+        if event == "start":
+            if root is None:
+                root = elem
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 1 and elem is not root:
+                yield elem
+                elem.clear()
+                if root is not None and len(root):
+                    del root[:]
+
+
 def _count_records_reference(path: str | Path) -> int:
     root: ET.Element | None = None
     depth = 0

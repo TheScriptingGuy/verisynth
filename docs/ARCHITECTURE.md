@@ -458,9 +458,21 @@ validation — as one document file per table:
   single array — rendering delegated to DuckDB's JSON writer; `jsonl` is
   newline-delimited) or one `<record>` element per row with one child
   element per column (`xml`; nulls omit the element).
+- **Relational nesting** (`format.nest`): a recursive list of
+  `{table, as?, columns?, nest?}` entries embeds a **direct child table's
+  rows** inside each parent record — a JSON array / repeated XML elements
+  (flat XML wraps them as `<{as}><{singular(as)}>…`). DuckDB does the
+  relational work out-of-core (`list(struct_pack(…) ORDER BY child_pk)
+  GROUP BY fk`, merged back on the parent key), childless parents get an
+  empty collection, the child's `parent_key` column is omitted by default
+  (redundant inside its parent), and nesting recurses through
+  grandchildren. Validation additionally checks that the summed nested
+  counts equal the child table's row count (JSON kinds).
 - **With schemas** rows are shaped into the schema's (possibly nested)
   structure by matching leaf property/element names to column names —
-  nested objects/elements group flat columns. `kind: json|jsonl` takes one
+  nested objects/elements group flat columns, while a JSON Schema `array`
+  property or an XSD `maxOccurs="unbounded"` particle (bare or wrapped in
+  a container element) binds to a `format.nest` entry by name. `kind: json|jsonl` takes one
   or more **JSON Schema** files: the first is the primary (its root, or its
   `items` when the root is an array, describes one record); additional
   files serve `$ref` targets (resolved by filename or `$id`, with JSON
@@ -506,6 +518,17 @@ the **scanner** detects string columns whose values parse as JSON objects
 attributes from payload columns when the skeleton declares them as
 siblings of a `document:` column but the real frame carries only the
 payload.
+
+Nested **entities** read back too: a JSON list-of-struct column, a
+repeated XML child element (every occurrence carrying element children),
+or an XML container element wrapping records of one tag is extracted by
+the scanner into a separate child table — exploded one row per nested
+record, with the parent's id-like columns (`id` / `*_id`) injected when
+the nested records don't already carry them — so PK/FK containment
+detection recovers the 1-N relation, recursively through deeper nesting.
+`verisynth fit` falls back to the same loaders when a skeleton table has
+no `{table}.parquet` in the input directory, so a directory of nested
+documents can be fitted directly.
 
 ## 12. Streaming XML & batch ingestion (`verisynth/xmlstream.py`)
 

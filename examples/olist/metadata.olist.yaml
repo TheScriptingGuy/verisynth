@@ -97,6 +97,13 @@ tables:
           - 0.64908
           - 0.35092
     source: crm
+    format:
+      kind: xml
+      root: contacts
+      record: contact
+      nest:
+      - table: crm_tickets
+        as: tickets
     rows: 25000
   crm_tickets:
     role: child
@@ -288,6 +295,13 @@ tables:
             mu: 14.512082367781652
             sigma: 0.41224146302846254
     source: shop
+    format:
+      kind: json
+      nest:
+      - table: order_items
+        as: items
+      - table: order_payments
+        as: payments
     parent: customers
     cardinality:
       kind: poisson
