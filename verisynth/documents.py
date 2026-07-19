@@ -6,10 +6,24 @@ primary key so output is byte-identical regardless of partition count) and
 renders one document file per table that declares a ``format`` in its
 ``TableSpec``. When ``format.schemas`` is set, the document is *shaped*
 according to a minimal, deterministic JSON Schema / XSD walk (no external
-schema-validation libraries): the schema is compiled once into a small plan
-and then applied per row. ``validate_documents`` re-derives the same record
-counts and never raises for a missing/corrupt document -- it reports a
-violation string instead.
+schema-validation libraries): the schema is compiled once (from the first
+row batch's column names, even when the table has zero rows, so compile-time
+schema errors still surface) and then applied per row. ``validate_documents``
+re-derives the same record counts and never raises for a missing/corrupt
+document -- it reports a violation string instead.
+
+Rows are never materialized in full: ``_iter_row_batches`` streams
+``DEFAULT_FETCH_ROWS``-sized batches from DuckDB (``fetchmany`` over an
+``ORDER BY <primary_key>`` cursor), and every renderer writes incrementally
+from those batches instead of building a Python list of records or a full
+XML ``ElementTree``. Memory stays O(batch) regardless of table size, so
+multi-GB+ documents render without exhausting RAM. XML record counting in
+``validate_documents`` similarly streams via ``xmlstream.count_xml_records``
+instead of parsing a full DOM. For very large tables, ``kind: jsonl`` is the
+recommended document kind: it streams one compact record per line with no
+surrounding array, which is friendlier to downstream consumers than a single
+multi-GB JSON array -- though the ``json`` array kind is still written
+streamingly and remains byte-identical to a non-streaming ``json.dump``.
 """
 
 from __future__ import annotations
@@ -19,16 +33,22 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import duckdb
 
 from .backbone import ParquetBackbone
 from .metadata import FormatSpec, Metadata, TableSpec
+from .xmlstream import count_xml_records
 
 _XS = "{http://www.w3.org/2001/XMLSchema}"
 
 _EXTENSIONS = {"json": ".json", "jsonl": ".jsonl", "xml": ".xml"}
+
+#: Rows fetched per DuckDB ``fetchmany`` call by ``_iter_row_batches``. A
+#: module-level constant (rather than baked into renderer call sites) so
+#: tests can tune batch size without touching every caller.
+DEFAULT_FETCH_ROWS = 65536
 
 
 class DocumentError(Exception):
@@ -66,15 +86,35 @@ def _resolve_schema_path(base_dir: Path | None, s: str, tname: str) -> Path:
 # --------------------------------------------------------------------------
 
 
-def _ordered_rows(glob: str, pk: str) -> tuple[list[str], list[tuple]]:
+def _iter_row_batches(
+    glob: str, pk: str, batch_rows: int = DEFAULT_FETCH_ROWS
+) -> Iterator[tuple[list[str], list[tuple]]]:
+    """Stream ``(col_names, rows_batch)`` tuples with O(batch) memory.
+
+    The DuckDB connection stays open across iteration and is closed in
+    ``finally`` whether the generator runs to completion or is abandoned
+    early (garbage-collected / ``.close()``d by the caller).
+
+    Column names are always available from the first yielded tuple, even
+    when the table has zero rows: on an empty result, exactly one
+    ``(col_names, [])`` batch is yielded so callers can still compile a
+    schema plan (and surface compile-time errors) against an empty table.
+    """
     con = duckdb.connect()
     try:
         result = con.execute(f"SELECT * FROM read_parquet('{glob}') ORDER BY {pk}")
         col_names = [d[0] for d in result.description]
-        rows = result.fetchall()
+        yielded_any = False
+        while True:
+            batch = result.fetchmany(batch_rows)
+            if not batch:
+                if not yielded_any:
+                    yield col_names, []
+                break
+            yielded_any = True
+            yield col_names, batch
     finally:
         con.close()
-    return col_names, rows
 
 
 def _xml_text(value: Any) -> str:
@@ -287,23 +327,39 @@ def _shape_json_node(
 
 
 def _render_json_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path) -> None:
-    col_names, rows = _ordered_rows(glob, t.primary_key)
+    batches = _iter_row_batches(glob, t.primary_key, batch_rows=DEFAULT_FETCH_ROWS)
+    col_names, first_batch = next(batches)
+    # Compile (and raise on unresolvable schema properties) before opening
+    # the output file, matching the old fetch-then-compile-then-write order.
     plan = _compile_json_record_schema(t.format, metadata.base_dir, t.name, set(col_names))
-    records = []
-    for row in rows:
-        row_dict = dict(zip(col_names, row))
-        _, record = _shape_json_node(plan, row_dict)
-        records.append(record)
+
+    def _all_batches() -> Iterator[list[tuple]]:
+        yield first_batch
+        for _cols, batch in batches:
+            yield batch
 
     if t.format.kind == "json":
         with open(path, "w") as f:
-            json.dump(records, f, indent=2)
-            f.write("\n")
+            wrote_any = False
+            for batch in _all_batches():
+                for row in batch:
+                    row_dict = dict(zip(col_names, row))
+                    _, record = _shape_json_node(plan, row_dict)
+                    rendered = "\n".join(
+                        "  " + line for line in json.dumps(record, indent=2).splitlines()
+                    )
+                    f.write("[\n" if not wrote_any else ",\n")
+                    f.write(rendered)
+                    wrote_any = True
+            f.write("\n]\n" if wrote_any else "[]\n")
     else:
         with open(path, "w") as f:
-            for rec in records:
-                f.write(json.dumps(rec, separators=(",", ":")))
-                f.write("\n")
+            for batch in _all_batches():
+                for row in batch:
+                    row_dict = dict(zip(col_names, row))
+                    _, record = _shape_json_node(plan, row_dict)
+                    f.write(json.dumps(record, separators=(",", ":")))
+                    f.write("\n")
 
 
 # --------------------------------------------------------------------------
@@ -316,26 +372,47 @@ def _render_xml_plain(t: TableSpec, glob: str, path: Path) -> None:
     root_name = fmt.root or t.name
     record_name = fmt.record or _singular(t.name)
 
-    col_names, rows = _ordered_rows(glob, t.primary_key)
+    def _records() -> Iterator[ET.Element]:
+        for col_names, batch in _iter_row_batches(
+            glob, t.primary_key, batch_rows=DEFAULT_FETCH_ROWS
+        ):
+            for row in batch:
+                rec_el = ET.Element(record_name)
+                for cname, value in zip(col_names, row):
+                    if value is None:
+                        continue
+                    child = ET.SubElement(rec_el, cname)
+                    child.text = _xml_text(value)
+                yield rec_el
 
-    root_el = ET.Element(root_name)
-    for row in rows:
-        rec_el = ET.SubElement(root_el, record_name)
-        for cname, value in zip(col_names, row):
-            if value is None:
-                continue
-            child = ET.SubElement(rec_el, cname)
-            child.text = _xml_text(value)
-
-    _write_xml_tree(root_el, path)
+    _write_xml_stream(root_name, _records(), path)
 
 
-def _write_xml_tree(root_el: ET.Element, path: Path) -> None:
-    tree = ET.ElementTree(root_el)
-    ET.indent(tree, space="  ")
-    tree.write(str(path), xml_declaration=True, encoding="unicode")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\n")
+def _write_xml_stream(root_name: str, record_elements: Iterator[ET.Element], path: Path) -> None:
+    """Stream ``<?xml ...?><root>...records...</root>`` byte-identically to
+    the old build-full-tree-then-``ET.indent`` writer, without ever holding
+    more than one record ``Element`` in memory.
+
+    Each record subtree is indented independently with ``ET.indent`` (the
+    2-space nesting is the same whether the element is a lone tree or a
+    subtree of a bigger one), serialized, then re-indented by one more level
+    (the record's position under ``<root>``) and written immediately.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("<?xml version='1.0' encoding='utf-8'?>\n")
+        wrote_any = False
+        for rec_el in record_elements:
+            if not wrote_any:
+                f.write(f"<{root_name}>")
+                wrote_any = True
+            ET.indent(rec_el, space="  ")
+            rec_xml = ET.tostring(rec_el, encoding="unicode")
+            f.write("\n")
+            f.write("\n".join("  " + line for line in rec_xml.splitlines()))
+        if wrote_any:
+            f.write(f"\n</{root_name}>\n")
+        else:
+            f.write(f"<{root_name} />\n")
 
 
 # --------------------------------------------------------------------------
@@ -585,17 +662,26 @@ def _render_xml_shaped(metadata: Metadata, t: TableSpec, glob: str, path: Path) 
     record_el, wrapper_name = _find_record_element(fmt, t, elements, complex_types)
     root_name = fmt.root or wrapper_name or t.name
 
-    col_names, rows = _ordered_rows(glob, t.primary_key)
+    batches = _iter_row_batches(glob, t.primary_key, batch_rows=DEFAULT_FETCH_ROWS)
+    col_names, first_batch = next(batches)
+    # Compile (and raise on unresolvable schema elements) before opening the
+    # output file, matching the old fetch-then-compile-then-write order.
     plan = _compile_xsd_record(record_el, elements, complex_types, t.name, set(col_names))
 
-    root_el = ET.Element(root_name)
-    for row in rows:
-        row_dict = dict(zip(col_names, row))
-        rec_el = _render_xsd_node(plan, row_dict)
-        if rec_el is not None:
-            root_el.append(rec_el)
+    def _all_batches() -> Iterator[list[tuple]]:
+        yield first_batch
+        for _cols, batch in batches:
+            yield batch
 
-    _write_xml_tree(root_el, path)
+    def _records() -> Iterator[ET.Element]:
+        for batch in _all_batches():
+            for row in batch:
+                row_dict = dict(zip(col_names, row))
+                rec_el = _render_xsd_node(plan, row_dict)
+                if rec_el is not None:
+                    yield rec_el
+
+    _write_xml_stream(root_name, _records(), path)
 
 
 # --------------------------------------------------------------------------
@@ -683,9 +769,8 @@ def validate_documents(metadata: Metadata, out_dir: str | Path) -> list[str]:
                     continue
             else:  # xml
                 try:
-                    tree = ET.parse(path)
-                    n = len(list(tree.getroot()))
-                except ET.ParseError as e:
+                    n = count_xml_records(path)
+                except (ET.ParseError, ValueError) as e:
                     violations.append(
                         f"{tname}: document {path} could not be parsed as XML: {e}"
                     )

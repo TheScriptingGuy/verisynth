@@ -20,6 +20,7 @@ privacy); generation is a **pure deterministic function** of `(seed, metadata)`.
 | Transforms | `verisynth/transforms.py` | Polars derived columns (`pl.sql_expr`) |
 | Backbone | `verisynth/backbone.py` | DuckDB out-of-core Parquet write + SQL validation |
 | Documents | `verisynth/documents.py` | JSON/XML document rendering (schema-shaped or flat) + validation |
+| XML streaming | `verisynth/xmlstream.py` | Bounded-memory XML reading, 100k-file batch ingestion (Rust fast path) |
 | Engine | `verisynth/engine.py` | Orchestration: per-partition Arrow table generation |
 | Fitter | `verisynth/fit.py` | Fit metadata params from real data |
 | Privacy | `verisynth/privacy.py` | Laplace mechanism, epsilon budget split |
@@ -368,8 +369,9 @@ and a shop database) as one entity tree. The pattern:
 verisynth generate -m metadata.yaml -o out/ [--partitions K] [--seed S]
 verisynth validate -m metadata.yaml -o out/
 verisynth fit --input <dir with {table}.parquet> -m skeleton.yaml -o fitted.yaml [--epsilon E] [--dp-seed S]
-verisynth scan --input <dir with {table}.parquet/.csv> [--json]
+verisynth scan --input <dir with {table}.parquet/.csv/.json/.jsonl/.xml> [--json]
 verisynth init -o skeleton.yaml [--input <data dir>] [--seed S] [--yes]
+verisynth ingest --input <file.xml | dir-of-xml> --out staging/ --table NAME [--workers N] [--batch-rows N] [--no-infer-types]
 ```
 
 Exit code 0 on success; `validate` exits 1 and prints violations if any;
@@ -480,3 +482,44 @@ The master-source pattern (§8) composes with this: a `web` or `edi` source
 whose tables inherit their business columns via `generator: parent:{column}`
 yields JSON/XML exports that agree row-for-row with the relational sources
 they mirror. See `examples/olist/` (sources `web` and `edi`).
+
+Document writing is **streamed**: rows are fetched from the Parquet
+partitions in record batches and appended incrementally, so memory stays
+O(batch) even for multi-GB document files. For very large tables prefer
+`kind: jsonl` — a single multi-GB JSON *array* is written fine but is
+awkward for downstream consumers.
+
+## 12. Streaming XML & batch ingestion (`verisynth/xmlstream.py`)
+
+XML at scale — single files up to multiple GB, and batches of 100k+ files —
+never builds a document tree:
+
+- **Streaming reader**: `iter_xml_batches(path, batch_rows)` yields
+  flattened, all-string record batches (Polars DataFrames) with O(batch)
+  memory. Records are the direct children of the document root; nested
+  elements flatten to leaf-named columns with the `{owner}_{leaf}` collision
+  rule; tags are reduced to local names (namespace-safe); attributes and
+  mixed content are ignored. `count_xml_records(path)` streams a record
+  count the same way.
+- **Backend dispatch** (same pattern as the §1.3 kernels): a Rust fast path
+  (`verisynth_kernels.stream_xml_file`, quick-xml, GIL released while
+  parsing) when the extension is built with XML support, and a pure-Python
+  `ET.iterparse` fallback with **identical record semantics** — the module
+  docstring in `xmlstream.py` is the normative spec, and
+  `tests/test_xmlstream_rust.py` asserts batch-for-batch parity.
+  `VERISYNTH_FORCE_REFERENCE=1` forces the fallback.
+- **Batch ingestion**: `xml_dir_to_parquet(input_dir, out_dir, workers,
+  batch_rows, infer_types)` ingests every `*.xml` file under a directory
+  (sorted; one logical table) into a Parquet staging dataset, one file per
+  worker process at a time (spawn-based pool — fork deadlocks under
+  polars/duckdb threads). Schemas may be ragged across files; consumers
+  read with `union_by_name`. With `infer_types` (default) a final
+  out-of-core DuckDB pass applies scanner-compatible typing
+  (int64 → float64 → bool → timestamp → string; the integer probe
+  regex-guards against DuckDB's decimal-string rounding) and compacts the
+  dataset. CLI: `verisynth ingest --input <file-or-dir> --out staging/
+  --table NAME [--workers N] [--batch-rows N] [--no-infer-types]`.
+- **Scanner**: `{table}.xml` files and `{table}/` subdirectories of XML
+  files stream through the same reader; scan profiling samples up to
+  `VERISYNTH_XML_SCAN_ROWS` (default 1,000,000) rows per table — scan is
+  advisory, while the full data flows through the staging path above.

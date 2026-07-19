@@ -12,6 +12,7 @@ from datetime import datetime
 import duckdb
 import pytest
 
+import verisynth.documents as documents_module
 from verisynth.documents import (
     DocumentError,
     document_path,
@@ -19,7 +20,7 @@ from verisynth.documents import (
     write_documents,
 )
 from verisynth.engine import Engine
-from verisynth.metadata import parse_metadata
+from verisynth.metadata import FormatSpec, parse_metadata
 
 SEED = 42
 
@@ -552,3 +553,223 @@ def test_write_documents_determinism_and_partition_invariance(tmp_path):
     content_p3 = document_path(out_dir3, md3.tables["orders"]).read_bytes()
 
     assert content_p1 == content_p3
+
+
+# --------------------------------------------------------------------------
+# 9. Streaming: large tables, batch-size-independent byte determinism, and
+#    zero-row tables (see docs/ARCHITECTURE.md §11 streaming addendum).
+# --------------------------------------------------------------------------
+
+BIG_SEED = 7
+
+
+def _big_metadata_dict(n: int, fmt: dict | None = None) -> dict:
+    d: dict = {
+        "version": 1,
+        "seed": BIG_SEED,
+        "tables": {
+            "big": {
+                "role": "root",
+                "rows": n,
+                "primary_key": "id",
+                "columns": {
+                    "id": {"type": "int64", "generator": "key"},
+                    "val": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["a", "b", "c"],
+                            "probs": [0.3, 0.3, 0.4],
+                        },
+                    },
+                    "note": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["x", "y"],
+                            "probs": [0.5, 0.5],
+                        },
+                        "null_rate": 0.4,
+                    },
+                },
+            }
+        },
+    }
+    if fmt is not None:
+        d["tables"]["big"]["format"] = fmt
+    return d
+
+
+_BIG_JSON_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "val": {"type": "string"},
+            "note": {"type": "string"},
+        },
+        "required": ["id", "val"],
+    },
+}
+
+_BIG_XSD = """<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="item">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="id" type="xs:long"/>
+        <xs:element name="val" type="xs:string"/>
+        <xs:element name="note" type="xs:string" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>
+"""
+
+
+def test_streaming_large_table_flat_xml_shaped_json_shaped_xml(tmp_path, monkeypatch):
+    """~150k-row table, rendered with a small batch size (patched module
+    constant): flat xml, schema-shaped json and schema-shaped xml must all
+    stream to a valid, fully-accounted-for document."""
+    monkeypatch.setattr(documents_module, "DEFAULT_FETCH_ROWS", 1000)
+
+    (tmp_path / "big.schema.json").write_text(json.dumps(_BIG_JSON_SCHEMA))
+    (tmp_path / "big.xsd").write_text(_BIG_XSD)
+
+    n = 150_000
+    md = parse_metadata(_big_metadata_dict(n=n, fmt={"kind": "xml"}))
+    md.base_dir = tmp_path
+    out_dir = tmp_path / "out"
+    Engine(md, seed=BIG_SEED).generate(str(out_dir), num_partitions=2)
+
+    # Flat xml.
+    write_documents(md, out_dir)
+    assert validate_documents(md, out_dir) == []
+    p_xml = document_path(out_dir, md.tables["big"])
+    root = ET.parse(p_xml).getroot()
+    assert len(list(root)) == n
+
+    # Schema-shaped json.
+    md.tables["big"].format = FormatSpec(kind="json", schemas=["big.schema.json"])
+    write_documents(md, out_dir)
+    assert validate_documents(md, out_dir) == []
+    p_json = document_path(out_dir, md.tables["big"])
+    with open(p_json) as f:
+        records = json.load(f)
+    assert len(records) == n
+
+    # Schema-shaped xml.
+    md.tables["big"].format = FormatSpec(kind="xml", schemas=["big.xsd"])
+    write_documents(md, out_dir)
+    assert validate_documents(md, out_dir) == []
+    p_xml2 = document_path(out_dir, md.tables["big"])
+    root2 = ET.parse(p_xml2).getroot()
+    assert len(list(root2)) == n
+    assert list(root2)[0].tag == "item"
+
+
+def test_write_documents_byte_identical_across_batch_sizes(tmp_path, monkeypatch):
+    """Schema-shaped json rendered with a tiny batch size must be byte-for-byte
+    identical to the same table rendered with one huge batch."""
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "val": {"type": "string"}},
+            "required": ["id", "val"],
+        },
+    }
+    (tmp_path / "s.schema.json").write_text(json.dumps(schema))
+    fmt = {"kind": "json", "schemas": ["s.schema.json"]}
+
+    n = 5000
+    md = parse_metadata(_big_metadata_dict(n=n, fmt=fmt))
+    md.base_dir = tmp_path
+    out_dir = tmp_path / "out"
+    Engine(md, seed=BIG_SEED).generate(str(out_dir), num_partitions=2)
+    p = document_path(out_dir, md.tables["big"])
+
+    monkeypatch.setattr(documents_module, "DEFAULT_FETCH_ROWS", 7)
+    write_documents(md, out_dir)
+    small_batch_bytes = p.read_bytes()
+
+    monkeypatch.setattr(documents_module, "DEFAULT_FETCH_ROWS", 10_000_000)
+    write_documents(md, out_dir)
+    huge_batch_bytes = p.read_bytes()
+
+    assert small_batch_bytes == huge_batch_bytes
+    assert json.loads(small_batch_bytes) is not None
+
+
+def test_empty_table_shaped_json_document(tmp_path):
+    """A zero-row child table (root has 1 row; bernoulli p is tiny enough
+    that no children are produced) must still compile its json schema and
+    render a valid, empty document."""
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "child_id": {"type": "integer"},
+                "val": {"type": "string"},
+            },
+            "required": ["child_id"],
+        },
+    }
+    (tmp_path / "child.schema.json").write_text(json.dumps(schema))
+    d = {
+        "version": 1,
+        "seed": SEED,
+        "tables": {
+            "parent": {
+                "role": "root",
+                "rows": 1,
+                "primary_key": "parent_id",
+                "columns": {
+                    "parent_id": {"type": "int64", "generator": "key"},
+                },
+            },
+            "child": {
+                "role": "child",
+                "parent": "parent",
+                "cardinality": {"kind": "bernoulli", "p": 0.000001},
+                "child_stride": 16,
+                "primary_key": "child_id",
+                "columns": {
+                    "child_id": {"type": "int64", "generator": "key"},
+                    "parent_id": {"type": "int64", "generator": "parent_key"},
+                    "val": {
+                        "type": "string",
+                        "distribution": {
+                            "kind": "categorical",
+                            "categories": ["a", "b"],
+                            "probs": [0.5, 0.5],
+                        },
+                    },
+                },
+                "format": {"kind": "json", "schemas": ["child.schema.json"]},
+            },
+        },
+    }
+    md = parse_metadata(d)
+    md.base_dir = tmp_path
+    out_dir = tmp_path / "out"
+    Engine(md, seed=SEED).generate(str(out_dir), num_partitions=1)
+
+    glob = str(out_dir / "child" / "*.parquet")
+    con = duckdb.connect()
+    try:
+        (n_child,) = con.execute(f"SELECT count(*) FROM read_parquet('{glob}')").fetchone()
+    finally:
+        con.close()
+    assert n_child == 0
+
+    write_documents(md, out_dir)
+    p = document_path(out_dir, md.tables["child"])
+    assert p.read_text() == "[]\n"
+    with open(p) as f:
+        records = json.load(f)
+    assert records == []
+
+    assert validate_documents(md, out_dir) == []
