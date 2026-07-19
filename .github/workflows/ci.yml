@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # Hard backstop: a wedged job (e.g. a native deadlock the per-test
+    # timeout can't interrupt) fails here instead of running for 6 hours.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Install the package (with dev deps)
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Build and install the Rust kernels
+        # Build + install the PyO3 extension via its maturin PEP-517 backend.
+        # (maturin develop needs an active virtualenv, which setup-python has
+        # not created — pip install builds in isolation and installs here.)
+        run: pip install ./rust
+
+      - name: Run the test suite (Rust backend)
+        run: python -m pytest -q
+
+      - name: Run the test suite (reference backend)
+        env:
+          VERISYNTH_FORCE_REFERENCE: "1"
+        run: python -m pytest -q

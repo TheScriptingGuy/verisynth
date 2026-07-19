@@ -16,13 +16,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "maturin"]
+dev = ["pytest", "pytest-timeout", "maturin"]
 
 [project.scripts]
 verisynth = "verisynth.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Fail (with a full thread traceback) any test that runs longer than this,
+# so an intermittent deadlock surfaces as a pinpointed failure instead of
+# freezing the CI job until the 6h GitHub default. Use the "thread" method,
+# not "signal": the kernels do their heavy work inside
+# `Python::allow_threads` (GIL released), where a SIGALRM handler can never
+# run — only a watchdog thread can observe the hang, dump every thread's
+# stack, and abort the process.
+timeout = 300
+timeout_method = "thread"
 
 [tool.setuptools]
 packages = ["verisynth"]
