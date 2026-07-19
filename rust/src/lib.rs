@@ -7,6 +7,9 @@
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+mod xmlstream;
+use xmlstream::{count_xml_records, stream_xml_file, XmlBatchIter};
+
 const GOLDEN: u64 = 0x9E3779B97F4A7C15;
 const MIX_C1: u64 = 0xBF58476D1CE4E5B9;
 const MIX_C2: u64 = 0x94D049BB133111EB;
@@ -172,5 +175,8 @@ fn verisynth_kernels(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(keyed_hash, m)?)?;
     m.add_function(wrap_pyfunction!(keyed_uniforms, m)?)?;
     m.add_function(wrap_pyfunction!(inv_norm_cdf, m)?)?;
+    m.add_function(wrap_pyfunction!(stream_xml_file, m)?)?;
+    m.add_function(wrap_pyfunction!(count_xml_records, m)?)?;
+    m.add_class::<XmlBatchIter>()?;
     Ok(())
 }

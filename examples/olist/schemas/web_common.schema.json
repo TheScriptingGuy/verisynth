@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "web_common.schema.json",
+  "title": "Shared definitions for web-source exports",
+  "definitions": {
+    "attribution": {
+      "type": "object",
+      "required": ["device"],
+      "properties": {
+        "device": {"type": "string"},
+        "utm_source": {"type": "string"}
+      }
+    }
+  }
+}

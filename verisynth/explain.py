@@ -209,6 +209,21 @@ def _describe_column(table: TableSpec, cname: str) -> str:
             )
         return f"generator: {col.generator}"
 
+    if col.document is not None:
+        doc = col.document
+        kind_name = "JSON object" if doc.kind == "json" else "XML fragment"
+        embedded = doc.columns or [
+            n for n, cc in table.columns.items() if n != cname and cc.document is None
+        ]
+        names = ", ".join(f"`{n}`" for n in embedded)
+        desc = f"a {kind_name} rendered per row from {names}"
+        if doc.schemas:
+            desc += " (shaped by " + ", ".join(f"`{s}`" for s in doc.schemas) + ")"
+        desc += " — always consistent with those columns"
+        if col.null_rate:
+            desc += f" ; {col.null_rate:.1%} null"
+        return desc
+
     if col.reference is not None:
         desc = describe_distribution(col.distribution) if col.distribution else ""
         return f"reference into `{col.reference}` — {desc}"
@@ -298,6 +313,24 @@ def _render_table(md: Metadata, tname: str) -> list[str]:
         lines.append(f"Child of `{t.parent}`: {phrase}.")
     lines.append("")
 
+    if t.format is not None:
+        kind_desc = {
+            "json": "a JSON document file",
+            "jsonl": "a JSON Lines document file",
+            "xml": "an XML document file",
+        }.get(t.format.kind, f"{t.format.kind} documents")
+        sentence = f"Also rendered as {kind_desc}"
+        if t.format.schemas:
+            names = ", ".join(f"`{s}`" for s in t.format.schemas)
+            sentence += f" shaped by {names}"
+        if t.format.nest:
+            nested = ", ".join(
+                f"`{n.table}` as `{n.alias or n.table}`" for n in t.format.nest
+            )
+            sentence += f", nesting {nested} inside each record"
+        lines.append(sentence + ".")
+        lines.append("")
+
     for cname, col in t.columns.items():
         lines.append(f"- **{cname}** ({col.type}): {_describe_column(t, cname)}")
     lines.append("")
@@ -345,7 +378,7 @@ def explain_metadata(md: Metadata) -> str:
     source_parts = []
     for src in named_sources:
         k = sum(1 for tname in order if md.tables[tname].source == src)
-        source_parts.append(f"{src} ({k} tables)")
+        source_parts.append(f"{src} ({k} table{'s' if k != 1 else ''})")
     if has_unassigned:
         source_parts.append("unassigned")
     sources_desc = ", ".join(source_parts) if source_parts else "unassigned"

@@ -29,6 +29,31 @@ byte-identical regardless of partition count.
   downstream tables inherit master attributes via `generator: parent:{column}`,
   so the generated sources agree row-for-row by construction. See
   `examples/olist/` for a two-source CRM + shop example.
+- **JSON / XML document synthesis**: a table with a `format:` block is also
+  rendered as a JSON, JSON Lines, or XML document file — flat (one object or
+  element per row) or shaped by one or more **JSON Schema** / **XSD** files
+  (nested objects/elements group flat columns by leaf name; `$ref` and
+  `xs:include`/`xs:import` across files are supported). Documents are written
+  from the canonical Parquet via DuckDB, ordered by primary key, so they are
+  byte-identical for any partition count; `verisynth validate` checks them, and
+  the scanner accepts `.json`/`.jsonl`/`.xml` input files too. See the `web`
+  (JSON) and `edi` (XML) sources in `examples/olist/`.
+- **In-table document columns**: a column-level `document:` block renders a
+  JSON object or XML fragment *per row* from the row's own sibling columns —
+  the payload always agrees with the relational columns by construction —
+  while the scanner and `fit` see through such payload columns in real data
+  (flattening them for profiling, extracting embedded attributes for fitting).
+- **Relational nesting**: `format.nest` embeds child-table rows inside each
+  parent record — JSON arrays / repeated XML elements, recursive through
+  grandchildren, grouped out-of-core by DuckDB and bindable to JSON Schema
+  `array` properties or XSD `maxOccurs="unbounded"` particles. The scanner
+  reverses it: nested entity collections in real JSON/XML become separate
+  child tables with the 1-N relation detected.
+- **XML at scale**: reading and writing stream with O(batch) memory — single
+  XML files up to multiple GB work on ordinary hardware, and
+  `verisynth ingest` batch-ingests directories of 100k+ XML files into a
+  typed Parquet staging dataset in parallel (Rust quick-xml fast path with a
+  pure-Python fallback, same dispatch pattern as the generation kernels).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design, including
 the normative hash-chain and metadata DSL specs.
@@ -64,6 +89,10 @@ verisynth validate -m examples/retail.yaml -o out/
 
 # render a metadata document as a plain-language Markdown explanation
 verisynth explain -m examples/retail.yaml -o explain.md
+
+# batch-ingest a directory of (possibly huge) XML files into a typed Parquet
+# staging dataset, in parallel, with bounded memory per worker
+verisynth ingest --input exports/ --out staging/ --table shipments --workers 8
 
 # fit metadata parameters from real data (one {table}.parquet per table),
 # optionally with differential privacy on the released parameters

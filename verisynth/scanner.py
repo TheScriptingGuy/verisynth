@@ -1,26 +1,45 @@
 """Metadata scanner: profile real tables and detect structure.
 
-Reads a directory of ``{table}.parquet`` / ``{table}.csv`` files and infers
-the structural facts a metadata skeleton needs: column types and null rates,
-primary-key candidates, foreign-key relations (with value-containment
-evidence), parent/child cardinality profiles, and per-column distribution
-suggestions. The interactive wizard (``verisynth init``, see wizard.py) uses
-the report as chat suggestions; ``verisynth scan`` prints it directly.
+Reads a directory of ``{table}.parquet`` / ``{table}.csv`` / ``{table}.json``
+(or ``.jsonl`` / ``.ndjson``) / ``{table}.xml`` files -- plus ``{table}/``
+subdirectories containing one or more ``*.xml`` files, loaded as a single
+logical table -- and infers the structural facts a metadata skeleton needs:
+column types and null rates, primary-key candidates, foreign-key relations
+(with value-containment evidence), parent/child cardinality profiles, and
+per-column distribution suggestions. The interactive wizard (``verisynth
+init``, see wizard.py) uses the report as chat suggestions; ``verisynth
+scan`` prints it directly.
 
 Detection is heuristic and advisory: nothing here mutates data, and every
 finding carries the evidence (coverage, counts) so a human can veto it.
+Every loaded frame is also post-processed by ``_expand_document_columns``,
+which sniffs and flattens string columns holding a JSON object or XML
+fragment per row (the scan-side counterpart of the metadata ``document:``
+column spec) before profiling.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+import duckdb
 import polars as pl
 
 from ._skeleton_infer import assign_source, infer_skeleton, init_from_dir  # noqa: F401
+from .xmlstream import flatten_xml_record, iter_xml_record_elements
+
+# Scan is advisory profiling, not a full ingestion pipeline (see `verisynth
+# ingest` / xmlstream.xml_dir_to_parquet for that): cap the number of XML
+# records materialized for a table at this many rows so a multi-GB file or
+# huge xml/ subdirectory can still be profiled in bounded time/memory,
+# overridable via VERISYNTH_XML_SCAN_ROWS for tests/tuning.
+_XML_SCAN_MAX_ROWS = 1_000_000
 
 # Containment threshold for accepting a foreign-key candidate: at least this
 # fraction of the child column's non-null values must exist in the parent key.
@@ -83,14 +102,386 @@ def _load_frames(input_dir: str | Path) -> dict[str, pl.DataFrame]:
     if not p.is_dir():
         raise FileNotFoundError(f"scan: {p} is not a directory")
     frames: dict[str, pl.DataFrame] = {}
+    def _add_xml(name: str, loaded: tuple[pl.DataFrame, dict[str, pl.DataFrame]]) -> None:
+        df, children = loaded
+        frames[name] = df
+        # Nested XML entity collections become their own tables, named after
+        # the repeated/container tag ({parent}_{tag} on collision).
+        for tag, cdf in children.items():
+            frames[tag if tag not in frames else f"{name}_{tag}"] = cdf
+
     for f in sorted(p.iterdir()):
+        if f.is_dir():
+            # A subdirectory of *.xml files is one logical table named after
+            # the subdirectory (100k-file ingestion uses the same shape --
+            # see xmlstream.xml_dir_to_parquet -- this is the scan-side
+            # analogue, capped for profiling).
+            xml_files = sorted(x for x in f.glob("*.xml") if x.is_file())
+            if xml_files:
+                _add_xml(f.name, _load_xml_dir(xml_files))
+            continue
         if f.suffix == ".parquet":
             frames[f.stem] = pl.read_parquet(f)
         elif f.suffix == ".csv":
             frames[f.stem] = pl.read_csv(f, try_parse_dates=True)
+        elif f.suffix in (".json", ".jsonl", ".ndjson"):
+            frames[f.stem] = _flatten_structs(_load_json(f))
+        elif f.suffix == ".xml":
+            _add_xml(f.stem, _load_xml(f))
     if not frames:
-        raise FileNotFoundError(f"scan: no .parquet or .csv files found in {p}")
-    return frames
+        raise FileNotFoundError(
+            f"scan: no .parquet, .csv, .json/.jsonl/.ndjson or .xml data files "
+            f"(or {{table}}/ xml subdirectories) found in {p}"
+        )
+    # In-table document columns (a string column storing a JSON object / XML
+    # fragment per row) apply to every input format alike -- expand them
+    # after loading, regardless of how the frame reached us. Then extract
+    # nested entity collections (JSON list-of-struct columns) into separate
+    # child tables so PK/FK detection can recover the relation.
+    frames = {name: _expand_document_columns(df) for name, df in frames.items()}
+    return _extract_nested_tables(frames)
+
+
+def _rescue_datetime_strings(df: pl.DataFrame) -> pl.DataFrame:
+    """Rescue string columns that parse cleanly as ISO-8601 (T-separated)
+    datetimes into ``pl.Datetime``, mirroring ``read_csv``'s
+    ``try_parse_dates``. Shared by ``_load_json`` (DuckDB's sniffer leaves
+    T-separated timestamps as VARCHAR) and ``_expand_document_columns``'s
+    JSON payload expansion (§11)."""
+    for c in df.columns:
+        if df[c].dtype == pl.String:
+            try:
+                df = df.with_columns(df[c].str.to_datetime(time_unit="us"))
+            except pl.exceptions.PolarsError:
+                pass
+    return df
+
+
+def _load_json(path: Path) -> pl.DataFrame:
+    """Load a JSON array or newline-delimited-JSON file via DuckDB.
+
+    ``read_json_auto`` handles both shapes (and nested objects, which surface
+    as ``pl.Struct`` columns that ``_flatten_structs`` unnests below) and
+    auto-detects timestamp-shaped strings.
+    """
+    con = duckdb.connect()
+    try:
+        arrow_tbl = con.execute(f"SELECT * FROM read_json_auto('{path}')").arrow()
+    finally:
+        con.close()
+    df = pl.from_arrow(arrow_tbl)
+    # DuckDB's sniffer types space-separated timestamps but leaves
+    # T-separated ISO-8601 strings (the JSON-document convention, §11) as
+    # VARCHAR -- rescue string columns that parse cleanly as datetimes,
+    # mirroring read_csv's try_parse_dates.
+    return _rescue_datetime_strings(df)
+
+
+def _flatten_structs(df: pl.DataFrame) -> pl.DataFrame:
+    """Recursively unnest ``pl.Struct`` columns into scalar leaf columns.
+
+    Each struct field is promoted to a top-level column under its own leaf
+    name; on a name collision with an already-existing column, the field is
+    renamed to ``{struct_column}_{field}`` instead. Repeats until no struct
+    columns remain (handles structs nested inside structs).
+    """
+    while True:
+        struct_col = next((c for c, dt in zip(df.columns, df.dtypes) if dt == pl.Struct), None)
+        if struct_col is None:
+            return df
+        existing = set(df.columns) - {struct_col}
+        field_names = [fld.name for fld in df.schema[struct_col].fields]
+        seen: set[str] = set()
+        new_names = []
+        for fname in field_names:
+            new_name = fname if fname not in existing and fname not in seen else f"{struct_col}_{fname}"
+            seen.add(new_name)
+            new_names.append(new_name)
+        df = df.with_columns(pl.col(struct_col).struct.rename_fields(new_names)).unnest(struct_col)
+
+
+# --------------------------------------------------------------------------
+# XML loading
+# --------------------------------------------------------------------------
+
+# Canonical flattening implementation now lives in xmlstream.py (streaming
+# reader + Rust/reference backend parity); kept here as a backward-compat
+# alias for any external callers of the old private name.
+_flatten_xml_record = flatten_xml_record
+
+
+def _infer_xml_column(s: pl.Series) -> pl.Series:
+    """Type an all-string XML column: int64, else float64, else bool, else
+    timestamp, else leave as string (in that order of preference)."""
+    nn = s.drop_nulls()
+    if nn.len() == 0:
+        return s
+    try:
+        return s.cast(pl.Int64, strict=True)
+    except pl.exceptions.PolarsError:
+        pass
+    try:
+        return s.cast(pl.Float64, strict=True)
+    except pl.exceptions.PolarsError:
+        pass
+    if set(nn.unique().to_list()) <= {"true", "false"}:
+        return s.replace_strict({"true": True, "false": False}, default=None, return_dtype=pl.Boolean)
+    try:
+        return s.str.to_datetime(time_unit="us")
+    except pl.exceptions.PolarsError:
+        pass
+    return s
+
+
+# --------------------------------------------------------------------------
+# In-table document columns (§11): a string column storing a JSON object /
+# XML fragment per row, sniffed and flattened during scan-side profiling.
+# The generation-side counterpart is the metadata ``document:`` column spec
+# (``ColumnDocumentSpec`` in metadata.py) -- fit.py's ``_expand_document_columns``
+# is the skeleton-aware fitting variant of the same idea.
+# --------------------------------------------------------------------------
+
+#: How many non-null values of a string column to sniff before deciding
+#: whether it holds a JSON object or XML fragment per row.
+_DOCUMENT_SNIFF_SAMPLE = 100
+
+
+def _looks_like_json_payload(sample: list[str]) -> bool:
+    if not sample:
+        return False
+    for v in sample:
+        s = v.strip()
+        if not s.startswith("{"):
+            return False
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(obj, dict):
+            return False
+    return True
+
+
+def _looks_like_xml_payload(sample: list[str]) -> bool:
+    if not sample:
+        return False
+    for v in sample:
+        s = v.strip()
+        if not s.startswith("<"):
+            return False
+        try:
+            ET.fromstring(s)
+        except ET.ParseError:
+            return False
+    return True
+
+
+def _merge_document_expansion(df: pl.DataFrame, payload_col: str, sub: pl.DataFrame) -> pl.DataFrame:
+    """Merge ``sub`` (one column per flattened leaf, same row order/height as
+    ``df``) into ``df``, dropping ``payload_col``. Leaf names collide with an
+    existing column (or another leaf of the same expansion) fall back to
+    ``{payload_col}_{leaf}`` -- the same convention as ``_flatten_structs``.
+    """
+    existing = set(df.columns) - {payload_col}
+    seen: set[str] = set()
+    rename: dict[str, str] = {}
+    for leaf in sub.columns:
+        new_name = leaf if leaf not in existing and leaf not in seen else f"{payload_col}_{leaf}"
+        seen.add(new_name)
+        rename[leaf] = new_name
+    sub = sub.rename(rename)
+    return df.drop(payload_col).hstack(sub)
+
+
+def _expand_json_document_column(df: pl.DataFrame, payload_col: str) -> pl.DataFrame:
+    dicts = [json.loads(v) if v is not None else None for v in df[payload_col].to_list()]
+    sub = pl.DataFrame(dicts, infer_schema_length=None)
+    sub = _flatten_structs(sub)
+    sub = _rescue_datetime_strings(sub)
+    return _merge_document_expansion(df, payload_col, sub)
+
+
+def _expand_xml_document_column(df: pl.DataFrame, payload_col: str) -> pl.DataFrame:
+    records = [
+        flatten_xml_record(ET.fromstring(v)) if v is not None else None
+        for v in df[payload_col].to_list()
+    ]
+    sub = pl.DataFrame(records, infer_schema_length=None)
+    sub = sub.with_columns(pl.all().cast(pl.String))
+    sub = sub.with_columns(_infer_xml_column(sub[c]) for c in sub.columns)
+    return _merge_document_expansion(df, payload_col, sub)
+
+
+def _expand_document_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Sniff every string column: if (up to) its first 100 non-null values
+    all parse as a JSON object or an XML fragment, expand it into flattened,
+    typed sibling columns and drop the payload column -- a unique-ish giant
+    string column would otherwise pollute PK-candidate ranking. Columns with
+    mixed/plain text (or no non-null values) are left untouched.
+    """
+    for cname in list(df.columns):
+        s = df[cname]
+        if s.dtype != pl.String:
+            continue
+        sample = s.drop_nulls().head(_DOCUMENT_SNIFF_SAMPLE).to_list()
+        if _looks_like_json_payload(sample):
+            df = _expand_json_document_column(df, cname)
+        elif _looks_like_xml_payload(sample):
+            df = _expand_xml_document_column(df, cname)
+    return df
+
+
+# --------------------------------------------------------------------------
+# Nested entity extraction (docs/ARCHITECTURE.md §11, read side of
+# format.nest): a JSON list-of-struct column, or repeated XML child
+# elements, hold the rows of a RELATED child entity -- profile them as a
+# separate table with the parent's id-like columns injected so FK
+# containment detection recovers the relation.
+# --------------------------------------------------------------------------
+
+
+def _id_like_columns(df: pl.DataFrame) -> list[str]:
+    return [
+        c
+        for c in df.columns
+        if (c == "id" or c.endswith("_id"))
+        and not isinstance(df.schema[c], (pl.List, pl.Struct))
+    ]
+
+
+def _extract_nested_tables(frames: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
+    """Pull every list-of-struct column out of every frame into its own
+    child-table frame (named after the column; ``{parent}_{column}`` on
+    collision), exploded one row per nested record, with the parent's
+    id-like columns injected (unless the nested records already carry
+    them). Recursive: extracted children are re-examined for deeper
+    nesting. The list column is dropped from the parent frame."""
+    out = dict(frames)
+    queue = list(frames.items())
+    while queue:
+        name, df = queue.pop(0)
+        for cname in list(df.columns):
+            dt = df.schema[cname]
+            if not (isinstance(dt, pl.List) and isinstance(dt.inner, pl.Struct)):
+                continue
+            ids = [c for c in _id_like_columns(df) if c != cname]
+            child = (
+                df.select(ids + [cname])
+                .explode(cname)
+                .filter(pl.col(cname).is_not_null())
+            )
+            # _flatten_structs unnests the struct column; nested-record
+            # fields colliding with the injected id columns land under
+            # {column}_{field} per the shared convention.
+            child = _rescue_datetime_strings(_flatten_structs(child))
+            child_name = cname if cname not in out else f"{name}_{cname}"
+            out[child_name] = child
+            queue.append((child_name, child))
+            df = df.drop(cname)
+            out[name] = df
+    return out
+
+
+def _local_tag(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+
+
+def _is_xml_entity_container(e: ET.Element) -> bool:
+    """A container of nested entity records: element children only, every
+    child itself has element children, and all children share one tag
+    (e.g. ``<lines><line>..</line><line>..</line></lines>``)."""
+    inner = [c for c in e if isinstance(c.tag, str)]
+    return (
+        bool(inner)
+        and all(list(c) for c in inner)
+        and len({_local_tag(c.tag) for c in inner}) == 1
+    )
+
+
+def _split_xml_record(
+    elem: ET.Element,
+) -> tuple[ET.Element, dict[str, list[dict[str, str | None]]]]:
+    """Split one raw record element into (scalar shell, nested entities).
+
+    Nested entities are (a) a tag repeated more than once where every
+    occurrence has element children, or (b) a single container element
+    matching ``_is_xml_entity_container`` (its grandchildren are the
+    records, named after the container). Everything else stays in the
+    scalar shell and flattens as before.
+    """
+    groups: dict[str, list[ET.Element]] = {}
+    for child in elem:
+        if isinstance(child.tag, str):
+            groups.setdefault(_local_tag(child.tag), []).append(child)
+
+    shell = ET.Element(elem.tag)
+    nested: dict[str, list[dict[str, str | None]]] = {}
+    for tag, els in groups.items():
+        if len(els) > 1 and all(list(e) for e in els):
+            nested[tag] = [flatten_xml_record(e) for e in els]
+        elif len(els) == 1 and _is_xml_entity_container(els[0]):
+            nested[tag] = [
+                flatten_xml_record(c) for c in els[0] if isinstance(c.tag, str)
+            ]
+        else:
+            shell.extend(els)
+    return shell, nested
+
+
+def _typed_xml_frame(rows: list[dict[str, str | None]]) -> pl.DataFrame:
+    if not rows:
+        return pl.DataFrame()
+    df = pl.DataFrame(rows, infer_schema_length=None)
+    df = df.with_columns(pl.all().cast(pl.String))
+    return df.with_columns(_infer_xml_column(df[c]) for c in df.columns)
+
+
+def _load_xml_records(paths: list[Path]) -> tuple[pl.DataFrame, dict[str, pl.DataFrame]]:
+    """Stream raw XML records from ``paths`` (sorted order, capped at the
+    scan sample size), splitting out nested entity collections into child
+    frames keyed by their tag."""
+    cap = _xml_scan_max_rows()
+    parent_rows: list[dict[str, str | None]] = []
+    nested_rows: dict[str, list[dict[str, str | None]]] = {}
+    for f in paths:
+        for elem in iter_xml_record_elements(f):
+            shell, nested = _split_xml_record(elem)
+            scalars = flatten_xml_record(shell)
+            parent_rows.append(scalars)
+            ids = {k: v for k, v in scalars.items() if k == "id" or k.endswith("_id")}
+            for tag, dicts in nested.items():
+                bucket = nested_rows.setdefault(tag, [])
+                for d in dicts:
+                    injected = {k: v for k, v in ids.items() if k not in d}
+                    bucket.append({**injected, **d})
+            if len(parent_rows) >= cap:
+                break
+        if len(parent_rows) >= cap:
+            break
+    return (
+        _typed_xml_frame(parent_rows),
+        {tag: _typed_xml_frame(rows) for tag, rows in nested_rows.items()},
+    )
+
+
+def _xml_scan_max_rows() -> int:
+    raw = os.environ.get("VERISYNTH_XML_SCAN_ROWS")
+    return int(raw) if raw else _XML_SCAN_MAX_ROWS
+
+
+def _load_xml(path: Path) -> tuple[pl.DataFrame, dict[str, pl.DataFrame]]:
+    """Load a single XML file: records are the child elements of the
+    document root, streamed record-by-record (bounded memory), capped at
+    the scan sample size, with nested entity collections split out as
+    child frames."""
+    return _load_xml_records([path])
+
+
+def _load_xml_dir(files: list[Path]) -> tuple[pl.DataFrame, dict[str, pl.DataFrame]]:
+    """Load a ``{table}/`` subdirectory of XML files as one logical table:
+    chain each file's records (sorted file order) through the same
+    record/cap logic used for a single file."""
+    return _load_xml_records(files)
 
 
 def _dsl_type(dtype: pl.DataType) -> str:

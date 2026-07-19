@@ -1,4 +1,4 @@
-# Synthetic dataset: 9 tables across crm (2 tables), shop (5 tables), inventory (2 tables)
+# Synthetic dataset: 11 tables across crm (2 tables), shop (5 tables), inventory (2 tables), web (1 table), edi (1 table)
 
 Deterministic generation with seed 20240817: identical output for identical metadata, any partition count.
 
@@ -7,6 +7,8 @@ Deterministic generation with seed 20240817: identical output for identical meta
 ### crm_contacts
 
 Root entity, 25,000 rows.
+
+Also rendered as an XML document file, nesting `crm_tickets` as `tickets` inside each record.
 
 - **contact_id** (int64): primary key
 - **state** (string): mostly SP (41.7%), RJ (12.8%), MG (12.0%) (27 categories) and 24 more
@@ -17,6 +19,8 @@ Root entity, 25,000 rows.
 ### crm_tickets
 
 Child of `crm_contacts`: on average 0.45 crm_tickets rows per crm_contacts row (up to 8).
+
+Also rendered as a JSON Lines document file.
 
 - **ticket_id** (int64): primary key
 - **contact_id** (int64): reference to the `crm_contacts` row
@@ -35,6 +39,8 @@ Event flow: `crm_contacts.created_at` → `opened_at` → `resolved_at`
 
 Child of `crm_contacts`: each crm_contacts row has one customers row with probability 60%.
 
+Also rendered as a JSON document file shaped by `schemas/shop_customer.schema.json`, nesting `orders` as `orders` inside each record.
+
 - **customer_id** (int64): primary key
 - **contact_id** (int64): reference to the `crm_contacts` row
 - **customer_state** (string): inherited from `crm_contacts.state` (master data — always identical to the parent's value)
@@ -42,6 +48,8 @@ Child of `crm_contacts`: each crm_contacts row has one customers row with probab
 ### orders
 
 Child of `customers`: on average 1 orders rows per customers row (up to 11).
+
+Also rendered as a JSON document file, nesting `order_items` as `items`, `order_payments` as `payments` inside each record.
 
 - **order_id** (int64): primary key
 - **customer_id** (int64): reference to the `customers` row
@@ -120,6 +128,38 @@ Child of `orders`: each orders row has one inv_shipments row with probability 98
 - **handed_over_at** (timestamp): happens typically 5.6 h (up to ~33.7 h) after `picked_at`
 
 Event flow: `orders.order_purchase_timestamp` → `created_at` → `picked_at` → `handed_over_at`
+
+## Source: web
+
+### web_orders
+
+Child of `orders`: each orders row has one web_orders row with probability 100%.
+
+Also rendered as a JSON document file shaped by `schemas/web_order.schema.json`, `schemas/web_common.schema.json`.
+
+- **web_order_id** (int64): primary key
+- **order_id** (int64): reference to the `orders` row
+- **status** (string): inherited from `orders.order_status` (master data — always identical to the parent's value)
+- **placed_at** (timestamp): inherited from `orders.order_purchase_timestamp` (master data — always identical to the parent's value)
+- **device** (string): mostly mobile (62.3%), desktop (32.7%), tablet (5.0%) (3 categories)
+- **utm_source** (string): mostly direct (39.9%), google (35.0%), social (15.4%) (4 categories) and 1 more
+- **payload** (string): a JSON object rendered per row from `order_id`, `status`, `placed_at`, `device`, `utm_source` — always consistent with those columns
+
+## Source: edi
+
+### edi_shipments
+
+Child of `inv_shipments`: each inv_shipments row has one edi_shipments row with probability 100%.
+
+Also rendered as an XML document file shaped by `schemas/edi_shipment.xsd`, `schemas/edi_common.xsd`.
+
+- **edi_message_id** (int64): primary key
+- **shipment_id** (int64): reference to the `inv_shipments` row
+- **service_level** (string): mostly standard (84.4%), express (15.6%) (2 categories)
+- **warehouse** (string): inherited from `inv_shipments.warehouse` (master data — always identical to the parent's value)
+- **carrier** (string): inherited from `inv_shipments.carrier` (master data — always identical to the parent's value)
+- **dispatched_at** (timestamp): inherited from `inv_shipments.handed_over_at` (master data — always identical to the parent's value)
+- **message** (string): a XML fragment rendered per row from `edi_message_id`, `shipment_id`, `service_level`, `warehouse`, `carrier`, `dispatched_at` (shaped by `schemas/edi_shipment.xsd`, `schemas/edi_common.xsd`) — always consistent with those columns
 
 ## Privacy
 

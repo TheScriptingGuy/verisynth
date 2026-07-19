@@ -1,5 +1,6 @@
 """Verisynth: metadata-driven synthetic relational data generation."""
 
+from .documents import DocumentError, validate_documents, write_documents
 from .engine import Engine
 from .metadata import Metadata, MetadataError, load_metadata, parse_metadata
 from .scanner import ScanReport, scan_directory
@@ -15,4 +16,7 @@ __all__ = [
     "Engine",
     "ScanReport",
     "scan_directory",
+    "DocumentError",
+    "write_documents",
+    "validate_documents",
 ]

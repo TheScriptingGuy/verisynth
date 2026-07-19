@@ -19,6 +19,8 @@ privacy); generation is a **pure deterministic function** of `(seed, metadata)`.
 | Temporal | `verisynth/temporal.py` | Delay propagation along event anchor DAG |
 | Transforms | `verisynth/transforms.py` | Polars derived columns (`pl.sql_expr`) |
 | Backbone | `verisynth/backbone.py` | DuckDB out-of-core Parquet write + SQL validation |
+| Documents | `verisynth/documents.py` | JSON/XML document rendering (schema-shaped or flat) + validation |
+| XML streaming | `verisynth/xmlstream.py` | Bounded-memory XML reading, 100k-file batch ingestion (Rust fast path) |
 | Engine | `verisynth/engine.py` | Orchestration: per-partition Arrow table generation |
 | Fitter | `verisynth/fit.py` | Fit metadata params from real data |
 | Privacy | `verisynth/privacy.py` | Laplace mechanism, epsilon budget split |
@@ -207,6 +209,13 @@ Rules:
   Delay units are **seconds**; sampled delays are clamped at ≥ 0.
 - `derived[].expr` is a Polars SQL expression string (`pl.sql_expr`), evaluated last;
   derived columns may reference any non-derived column.
+- Optional per-table `format: {kind, schemas?, root?, record?}` — renders the table
+  as a JSON/JSONL/XML **document file** in addition to its Parquet partitions
+  (§11). `kind` ∈ `json` | `jsonl` | `xml`; `schemas` lists zero or more JSON
+  Schema (`.json`) or XSD (`.xsd`) files that shape the documents (`schema: path`
+  is scalar shorthand); `root`/`record` name the XML wrapper and per-row elements
+  (xml only). Relative schema paths resolve against the metadata document's
+  directory.
 - Validation errors raise `MetadataError` with a message naming the offending path.
 
 ## 3. Row keys, cardinality, partition-by-root
@@ -267,6 +276,8 @@ If the anchor value is null, the result is null. Cycles → `MetadataError`.
 4. Emit `dict[str, pa.Table]`; backbone writes
    `{out}/{source}/{table}/part-{p:05d}.parquet` via DuckDB `COPY`
    (`{out}/{table}/...` when the table has no `source`).
+5. After all partitions are written, tables with a `format:` block are
+   additionally rendered as JSON/XML document files (§11).
 
 Public API:
 
@@ -358,8 +369,9 @@ and a shop database) as one entity tree. The pattern:
 verisynth generate -m metadata.yaml -o out/ [--partitions K] [--seed S]
 verisynth validate -m metadata.yaml -o out/
 verisynth fit --input <dir with {table}.parquet> -m skeleton.yaml -o fitted.yaml [--epsilon E] [--dp-seed S]
-verisynth scan --input <dir with {table}.parquet/.csv> [--json]
+verisynth scan --input <dir with {table}.parquet/.csv/.json/.jsonl/.xml> [--json]
 verisynth init -o skeleton.yaml [--input <data dir>] [--seed S] [--yes]
+verisynth ingest --input <file.xml | dir-of-xml> --out staging/ --table NAME [--workers N] [--batch-rows N] [--no-infer-types]
 ```
 
 Exit code 0 on success; `validate` exits 1 and prints violations if any;
@@ -420,3 +432,135 @@ Deterministic structural-inference rules (shared by chat defaults and
   matrix.
 - **Sources**: repeatable `--source NAME=PATTERN` (fnmatch, first match
   wins) assigns `source:` labels in both chat and `--yes` modes.
+
+Scanner input formats: alongside `{table}.parquet` / `{table}.csv`, the
+scanner (and therefore `scan`, `init`, and any flow built on `_load_frames`)
+accepts `{table}.json` / `.jsonl` / `.ndjson` (read via DuckDB
+`read_json_auto`; nested objects are flattened to their leaf field names,
+falling back to `{struct}_{field}` on collision) and `{table}.xml` (records
+are the children of the document root; nested elements flatten the same way;
+element text is type-inferred int → float → bool → timestamp → string).
+Flattening is the inverse of the §11 schema-shaping convention, so scanning
+a directory of shaped documents recovers the flat column model.
+
+## 11. Document synthesis (JSON / XML)
+
+Real source systems rarely exchange Parquet: they export JSON APIs and XML
+messages. A table with a `format:` block (§2) is rendered — in addition to
+its canonical Parquet partitions, which remain the substrate for SQL
+validation — as one document file per table:
+`{out}/{source}/{table}.json|.jsonl|.xml`.
+
+- Rows are read back from the Parquet partitions with DuckDB, `ORDER BY`
+  the primary key — document files are **byte-identical for any partition
+  count** (the same guarantee §3 gives the Parquet dataset).
+- **Without schemas** documents are flat: one object per row (`json` is a
+  single array — rendering delegated to DuckDB's JSON writer; `jsonl` is
+  newline-delimited) or one `<record>` element per row with one child
+  element per column (`xml`; nulls omit the element).
+- **Relational nesting** (`format.nest`): a recursive list of
+  `{table, as?, columns?, nest?}` entries embeds a **direct child table's
+  rows** inside each parent record — a JSON array / repeated XML elements
+  (flat XML wraps them as `<{as}><{singular(as)}>…`). DuckDB does the
+  relational work out-of-core (`list(struct_pack(…) ORDER BY child_pk)
+  GROUP BY fk`, merged back on the parent key), childless parents get an
+  empty collection, the child's `parent_key` column is omitted by default
+  (redundant inside its parent), and nesting recurses through
+  grandchildren. Validation additionally checks that the summed nested
+  counts equal the child table's row count (JSON kinds).
+- **With schemas** rows are shaped into the schema's (possibly nested)
+  structure by matching leaf property/element names to column names —
+  nested objects/elements group flat columns, while a JSON Schema `array`
+  property or an XSD `maxOccurs="unbounded"` particle (bare or wrapped in
+  a container element) binds to a `format.nest` entry by name. `kind: json|jsonl` takes one
+  or more **JSON Schema** files: the first is the primary (its root, or its
+  `items` when the root is an array, describes one record); additional
+  files serve `$ref` targets (resolved by filename or `$id`, with JSON
+  pointers). `kind: xml` takes one or more **XSD** files: `xs:include` /
+  `xs:import` are followed transitively, named `xs:complexType`s and global
+  `xs:element`s may live in any provided file, the record element is
+  `format.record` (or discovered from a wrapper root element declared with
+  a single `maxOccurs="unbounded"` particle), and `minOccurs="0"` elements
+  are omitted when the column value is null.
+- Schema enforcement happens at **compile time**: a required schema
+  property/element with no matching column raises `DocumentError` before
+  anything is written — no external validation libraries are involved.
+- `validate` (and `validate_dataset`) additionally checks every declared
+  document: the file exists and its record count matches the Parquet
+  partitions (JSON counted via DuckDB `read_json_auto`, XML via
+  ElementTree).
+
+The master-source pattern (§8) composes with this: a `web` or `edi` source
+whose tables inherit their business columns via `generator: parent:{column}`
+yields JSON/XML exports that agree row-for-row with the relational sources
+they mirror. See `examples/olist/` (sources `web` and `edi`).
+
+Document writing is **streamed**: rows are fetched from the Parquet
+partitions in record batches and appended incrementally, so memory stays
+O(batch) even for multi-GB document files. For very large tables prefer
+`kind: jsonl` — a single multi-GB JSON *array* is written fine but is
+awkward for downstream consumers.
+
+**In-table document columns** are the second route: real systems often
+store a JSON object or XML fragment *per row* in a string column
+(payload/body/message). A column-level `document:` block —
+`{kind: json|xml, columns?, schemas?, root?}` — makes the column's value a
+per-row rendering of the row's OWN sibling columns (`columns:` selects
+them; default is every sibling without a document spec). The payload is a
+**serialization of the record, never independently sampled**, so it agrees
+with the relational columns cell-for-cell by construction. The same JSON
+Schema / XSD machinery shapes nested payloads; XML fragments use
+`root:` as the element name (default: singularized table name) and are
+written compact (single-line cell values). The read side mirrors this:
+the **scanner** detects string columns whose values parse as JSON objects
+/ XML elements and flattens them into typed leaf columns for profiling
+(dropping the raw payload from PK ranking), and **fit** extracts embedded
+attributes from payload columns when the skeleton declares them as
+siblings of a `document:` column but the real frame carries only the
+payload.
+
+Nested **entities** read back too: a JSON list-of-struct column, a
+repeated XML child element (every occurrence carrying element children),
+or an XML container element wrapping records of one tag is extracted by
+the scanner into a separate child table — exploded one row per nested
+record, with the parent's id-like columns (`id` / `*_id`) injected when
+the nested records don't already carry them — so PK/FK containment
+detection recovers the 1-N relation, recursively through deeper nesting.
+`verisynth fit` falls back to the same loaders when a skeleton table has
+no `{table}.parquet` in the input directory, so a directory of nested
+documents can be fitted directly.
+
+## 12. Streaming XML & batch ingestion (`verisynth/xmlstream.py`)
+
+XML at scale — single files up to multiple GB, and batches of 100k+ files —
+never builds a document tree:
+
+- **Streaming reader**: `iter_xml_batches(path, batch_rows)` yields
+  flattened, all-string record batches (Polars DataFrames) with O(batch)
+  memory. Records are the direct children of the document root; nested
+  elements flatten to leaf-named columns with the `{owner}_{leaf}` collision
+  rule; tags are reduced to local names (namespace-safe); attributes and
+  mixed content are ignored. `count_xml_records(path)` streams a record
+  count the same way.
+- **Backend dispatch** (same pattern as the §1.3 kernels): a Rust fast path
+  (`verisynth_kernels.stream_xml_file`, quick-xml, GIL released while
+  parsing) when the extension is built with XML support, and a pure-Python
+  `ET.iterparse` fallback with **identical record semantics** — the module
+  docstring in `xmlstream.py` is the normative spec, and
+  `tests/test_xmlstream_rust.py` asserts batch-for-batch parity.
+  `VERISYNTH_FORCE_REFERENCE=1` forces the fallback.
+- **Batch ingestion**: `xml_dir_to_parquet(input_dir, out_dir, workers,
+  batch_rows, infer_types)` ingests every `*.xml` file under a directory
+  (sorted; one logical table) into a Parquet staging dataset, one file per
+  worker process at a time (spawn-based pool — fork deadlocks under
+  polars/duckdb threads). Schemas may be ragged across files; consumers
+  read with `union_by_name`. With `infer_types` (default) a final
+  out-of-core DuckDB pass applies scanner-compatible typing
+  (int64 → float64 → bool → timestamp → string; the integer probe
+  regex-guards against DuckDB's decimal-string rounding) and compacts the
+  dataset. CLI: `verisynth ingest --input <file-or-dir> --out staging/
+  --table NAME [--workers N] [--batch-rows N] [--no-infer-types]`.
+- **Scanner**: `{table}.xml` files and `{table}/` subdirectories of XML
+  files stream through the same reader; scan profiling samples up to
+  `VERISYNTH_XML_SCAN_ROWS` (default 1,000,000) rows per table — scan is
+  advisory, while the full data flows through the staging path above.

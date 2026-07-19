@@ -37,9 +37,11 @@ SKELETON_PATH = OLIST_DIR / "skeleton.yaml"
 FITTED_PATH = OLIST_DIR / "metadata.olist.yaml"
 DATA_DIR = OLIST_DIR / "data"
 
-# All 9 tables across the three source systems (crm: crm_contacts,
+# All 11 tables across the five source systems (crm: crm_contacts,
 # crm_tickets; shop: customers, orders, order_items, order_payments,
-# order_reviews; inventory: inv_products, inv_shipments).
+# order_reviews; inventory: inv_products, inv_shipments; web: web_orders;
+# edi: edi_shipments — the two document sources, TASK CARD 17 /
+# docs/ARCHITECTURE.md §11).
 TABLE_NAMES = (
     "crm_contacts",
     "crm_tickets",
@@ -50,6 +52,8 @@ TABLE_NAMES = (
     "order_reviews",
     "inv_products",
     "inv_shipments",
+    "web_orders",
+    "edi_shipments",
 )
 
 SOURCE_TABLES = (
@@ -62,6 +66,8 @@ SOURCE_TABLES = (
     ("shop", "order_reviews"),
     ("inventory", "inv_products"),
     ("inventory", "inv_shipments"),
+    ("web", "web_orders"),
+    ("edi", "edi_shipments"),
 )
 
 
@@ -95,6 +101,18 @@ def _load_inventory_prep_module():
     constants (TASK CARD 14)."""
     path = OLIST_DIR / "prepare_inventory_data.py"
     spec = importlib.util.spec_from_file_location("olist_prepare_inventory_data", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_docs_prep_module():
+    """Load ``examples/olist/prepare_docs_data.py`` by path (mirrors the
+    loaders above) to import its authored ground-truth constants
+    (TASK CARD 17)."""
+    path = OLIST_DIR / "prepare_docs_data.py"
+    spec = importlib.util.spec_from_file_location("olist_prepare_docs_data", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -158,6 +176,11 @@ def crm_prep_module():
 @pytest.fixture(scope="module")
 def inventory_prep_module():
     return _load_inventory_prep_module()
+
+
+@pytest.fixture(scope="module")
+def docs_prep_module():
+    return _load_docs_prep_module()
 
 
 @pytest.fixture(scope="module")
@@ -691,3 +714,329 @@ def test_determinism_inv_shipments(fitted_metadata):
 
     assert tables1["inv_shipments"].equals(tables2["inv_shipments"])
     assert tables1["inv_products"].equals(tables2["inv_products"])
+
+
+# --------------------------------------------------------------------------
+# 10. Document sources: web (JSON) and edi (XML) (TASK CARD 17,
+#     docs/ARCHITECTURE.md §11).
+# --------------------------------------------------------------------------
+
+
+def _document_paths(out_dir: Path) -> dict[str, Path]:
+    return {
+        "crm_tickets": out_dir / "crm" / "crm_tickets.jsonl",
+        "web_orders": out_dir / "web" / "web_orders.json",
+        "edi_shipments": out_dir / "edi" / "edi_shipments.xml",
+        "orders": out_dir / "shop" / "orders.json",
+        "crm_contacts": out_dir / "crm" / "crm_contacts.xml",
+        "customers": out_dir / "shop" / "customers.json",
+    }
+
+
+def test_document_files_written(synth_out_dir):
+    """Engine.generate renders the declared documents next to the per-source
+    Parquet partitions."""
+    for tname, path in _document_paths(synth_out_dir).items():
+        assert path.is_file(), path
+
+
+def test_fitted_docs_bernoulli_mirrors_are_exact(fitted_metadata):
+    """The mirror samples emit exactly one row per parent row, so fit
+    recovers bernoulli p = 1.0 for both document tables."""
+    for tname in ("web_orders", "edi_shipments"):
+        card = fitted_metadata.tables[tname].cardinality
+        assert card.kind == "bernoulli", tname
+        assert card.params["p"] == 1.0, tname
+
+
+def test_fitted_docs_categorical_fidelity(fitted_metadata, docs_prep_module):
+    checks = [
+        ("web_orders", "device", docs_prep_module.DEVICES, docs_prep_module.DEVICE_PROBS),
+        ("web_orders", "utm_source", docs_prep_module.UTM_SOURCES, docs_prep_module.UTM_SOURCE_PROBS),
+        ("edi_shipments", "service_level", docs_prep_module.SERVICE_LEVELS, docs_prep_module.SERVICE_LEVEL_PROBS),
+    ]
+    for table, column, categories, probs in checks:
+        fitted = _dist_probs(fitted_metadata, table, column)
+        for cat, authored_p in zip(categories, probs):
+            assert abs(fitted.get(cat, 0.0) - authored_p) < 0.02, (table, column, cat)
+
+
+def test_web_orders_json_agrees_with_shop_orders(synth_out_dir, synth_frames):
+    """The JSON export is schema-shaped (nested attribution object) and
+    agrees row-for-row with the relational shop source — by construction,
+    zero mismatches, not a statistical tolerance."""
+    import json as json_mod
+    from datetime import datetime
+
+    with open(_document_paths(synth_out_dir)["web_orders"]) as f:
+        records = json_mod.load(f)
+
+    orders = synth_frames["orders"]
+    assert len(records) == orders.height  # bernoulli p = 1.0 mirror
+
+    by_order = {
+        row["order_id"]: row
+        for row in orders.select(
+            ["order_id", "order_status", "order_purchase_timestamp"]
+        ).iter_rows(named=True)
+    }
+
+    web = synth_frames["web_orders"]
+    assert len(records) == web.height
+
+    for rec in records:
+        # Shape: schema-driven nesting + required leaves.
+        assert set(rec) <= {"web_order_id", "order_id", "status", "placed_at", "attribution"}
+        assert set(rec["attribution"]) == {"device", "utm_source"}
+
+        src = by_order[rec["order_id"]]
+        assert rec["status"] == src["order_status"]
+        assert datetime.fromisoformat(rec["placed_at"]) == src["order_purchase_timestamp"]
+
+
+def test_edi_shipments_xml_agrees_with_inventory(synth_out_dir, synth_frames):
+    """The XML export follows the XSD (element order, nested routing) and
+    agrees row-for-row with the inventory source."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(_document_paths(synth_out_dir)["edi_shipments"]).getroot()
+    assert root.tag == "shipments"
+
+    shipments = synth_frames["inv_shipments"]
+    assert len(root) == shipments.height  # bernoulli p = 1.0 mirror
+
+    by_shipment = {
+        row["shipment_id"]: row
+        for row in shipments.select(["shipment_id", "warehouse", "carrier"]).iter_rows(
+            named=True
+        )
+    }
+
+    for rec in root:
+        assert rec.tag == "shipment"
+        # Element order is the XSD sequence, with routing nesting the
+        # warehouse/carrier columns (edi_common.xsd RoutingType).
+        assert [child.tag for child in rec] == [
+            "edi_message_id",
+            "shipment_id",
+            "service_level",
+            "routing",
+            "dispatched_at",
+        ]
+        routing = rec.find("routing")
+        assert [child.tag for child in routing] == ["warehouse", "carrier"]
+
+        src = by_shipment[int(rec.find("shipment_id").text)]
+        assert routing.find("warehouse").text == src["warehouse"]
+        assert routing.find("carrier").text == src["carrier"]
+
+
+def test_crm_tickets_jsonl_is_flat(synth_out_dir, synth_frames):
+    """The schema-less JSONL feed is one flat object per row with every
+    column present."""
+    import json as json_mod
+
+    tickets = synth_frames["crm_tickets"]
+    with open(_document_paths(synth_out_dir)["crm_tickets"]) as f:
+        lines = [line for line in f if line.strip()]
+
+    assert len(lines) == tickets.height
+    first = json_mod.loads(lines[0])
+    assert set(first) == set(tickets.columns)
+
+
+def test_web_orders_payload_column_agrees_with_row(synth_frames):
+    """In-table document column (docs/ARCHITECTURE.md §11): every
+    web_orders.payload cell is a compact JSON serialization of its own row's
+    columns — cell-for-cell agreement, by construction."""
+    import json as json_mod
+    from datetime import datetime
+
+    web = synth_frames["web_orders"]
+    assert web["payload"].null_count() == 0
+
+    for row in web.iter_rows(named=True):
+        payload = json_mod.loads(row["payload"])
+        assert list(payload) == ["order_id", "status", "placed_at", "device", "utm_source"]
+        assert payload["order_id"] == row["order_id"]
+        assert payload["status"] == row["status"]
+        assert payload["device"] == row["device"]
+        assert payload["utm_source"] == row["utm_source"]
+        assert datetime.fromisoformat(payload["placed_at"]) == row["placed_at"]
+        assert "\n" not in row["payload"]
+
+
+def test_edi_shipments_message_column_agrees_with_row(synth_frames):
+    """edi_shipments.message stores the raw XSD-shaped <shipment> fragment
+    per row, matching the row's columns and the file export's element
+    structure (nested <routing> from edi_common.xsd)."""
+    import xml.etree.ElementTree as ET
+
+    edi = synth_frames["edi_shipments"]
+    for row in edi.iter_rows(named=True):
+        el = ET.fromstring(row["message"])
+        assert el.tag == "shipment"
+        assert [c.tag for c in el] == [
+            "edi_message_id",
+            "shipment_id",
+            "service_level",
+            "routing",
+            "dispatched_at",
+        ]
+        assert int(el.find("shipment_id").text) == row["shipment_id"]
+        assert el.find("routing/warehouse").text == row["warehouse"]
+        assert el.find("routing/carrier").text == row["carrier"]
+        assert el.find("service_level").text == row["service_level"]
+
+
+def test_scan_sees_through_generated_payload_columns(synth_out_dir, tmp_path, fitted_metadata):
+    """Read-route round trip: scanning a table whose payload column holds
+    JSON documents flattens it into typed leaf columns and drops the raw
+    payload from profiling."""
+    import shutil
+
+    from verisynth.scanner import scan_directory
+
+    scan_dir = tmp_path / "scan-payload"
+    scan_dir.mkdir()
+    src = synth_out_dir / "web" / "web_orders"
+    merged = pl.read_parquet(str(src / "*.parquet"))
+    merged.write_parquet(scan_dir / "web_orders.parquet")
+
+    report = scan_directory(scan_dir)
+    cols = set(report.tables["web_orders"].columns)
+    assert "payload" not in cols
+    # Leaf names collide with the real sibling columns, so the expansion
+    # lands under the payload-prefixed fallback names.
+    assert {"payload_order_id", "payload_status", "payload_device"} <= cols
+
+
+def test_orders_json_nests_items_and_payments(synth_out_dir, synth_frames):
+    """Relational nesting (format.nest): every order_items / order_payments
+    row appears exactly once inside its parent order's record, ordered by
+    child pk, with the redundant order_id link omitted."""
+    import json as json_mod
+
+    with open(_document_paths(synth_out_dir)["orders"]) as f:
+        records = json_mod.load(f)
+    assert len(records) == synth_frames["orders"].height
+
+    items = synth_frames["order_items"]
+    by_order: dict = {}
+    for row in items.sort("order_item_id").iter_rows(named=True):
+        by_order.setdefault(row["order_id"], []).append(row)
+
+    total_nested = 0
+    for rec in records:
+        nested = rec["items"]
+        expected = by_order.get(rec["order_id"], [])
+        assert [n["order_item_id"] for n in nested] == [e["order_item_id"] for e in expected]
+        for n, e in zip(nested, expected):
+            assert "order_id" not in n
+            assert n["price"] == e["price"]
+            assert n["product_id"] == e["product_id"]
+        total_nested += len(nested)
+    assert total_nested == items.height
+    assert sum(len(r["payments"]) for r in records) == synth_frames["order_payments"].height
+
+
+def test_crm_contacts_xml_nests_tickets(synth_out_dir, synth_frames):
+    """Each <contact> nests its crm_tickets rows as <tickets><ticket>...;
+    the nested rows agree with the flat crm_tickets table."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(_document_paths(synth_out_dir)["crm_contacts"]).getroot()
+    assert root.tag == "contacts"
+    assert len(root) == synth_frames["crm_contacts"].height
+
+    tickets = synth_frames["crm_tickets"]
+    by_contact: dict = {}
+    for row in tickets.sort("ticket_id").iter_rows(named=True):
+        by_contact.setdefault(row["contact_id"], []).append(row)
+
+    total = 0
+    for rec in root:
+        contact_id = int(rec.find("contact_id").text)
+        container = rec.find("tickets")
+        nested = list(container) if container is not None else []
+        expected = by_contact.get(contact_id, [])
+        assert [int(n.find("ticket_id").text) for n in nested] == [
+            e["ticket_id"] for e in expected
+        ]
+        for n, e in zip(nested, expected):
+            assert n.find("channel").text == e["channel"]
+        total += len(nested)
+    assert total == tickets.height
+
+
+def test_customers_json_schema_bound_two_level_nesting(synth_out_dir, synth_frames):
+    """Schema-bound, two-level relational nesting: customers.json nests
+    orders inside customers and order_items inside orders, shaped by
+    shop_customer.schema.json — every order and item row appears exactly
+    once, ordered by child pk, agreeing with the flat tables."""
+    import json as json_mod
+
+    with open(_document_paths(synth_out_dir)["customers"]) as f:
+        records = json_mod.load(f)
+    assert len(records) == synth_frames["customers"].height
+
+    orders_by_customer: dict = {}
+    for row in synth_frames["orders"].sort("order_id").iter_rows(named=True):
+        orders_by_customer.setdefault(row["customer_id"], []).append(row)
+    items_by_order: dict = {}
+    for row in synth_frames["order_items"].sort("order_item_id").iter_rows(named=True):
+        items_by_order.setdefault(row["order_id"], []).append(row)
+
+    total_orders = total_items = 0
+    for rec in records:
+        # Schema-shaped: only declared properties, schema property order.
+        assert set(rec) <= {"customer_id", "contact_id", "customer_state", "orders"}
+        expected_orders = orders_by_customer.get(rec["customer_id"], [])
+        assert [o["order_id"] for o in rec["orders"]] == [
+            e["order_id"] for e in expected_orders
+        ]
+        total_orders += len(rec["orders"])
+        for o, e in zip(rec["orders"], expected_orders):
+            assert set(o) <= {"order_id", "order_status", "order_purchase_timestamp", "items"}
+            assert o["order_status"] == e["order_status"]
+            expected_items = items_by_order.get(o["order_id"], [])
+            assert [i["order_item_id"] for i in o["items"]] == [
+                x["order_item_id"] for x in expected_items
+            ]
+            total_items += len(o["items"])
+    assert total_orders == synth_frames["orders"].height
+    assert total_items == synth_frames["order_items"].height
+
+
+def test_scan_reverses_nested_documents(synth_out_dir, tmp_path):
+    """Read-route round trip: scanning the nested orders.json recovers
+    items/payments as separate child tables related to orders."""
+    import shutil
+
+    from verisynth.scanner import scan_directory
+
+    scan_dir = tmp_path / "scan-nested"
+    scan_dir.mkdir()
+    shutil.copy(_document_paths(synth_out_dir)["orders"], scan_dir / "orders.json")
+
+    report = scan_directory(scan_dir)
+    assert {"orders", "items", "payments"} <= set(report.tables)
+    assert "items" not in report.tables["orders"].columns
+    rels = {
+        (r.child, r.parent, r.child_column)
+        for r in report.relations
+    }
+    assert ("items", "orders", "order_id") in rels
+    assert ("payments", "orders", "order_id") in rels
+
+
+def test_document_determinism_across_partitions(tmp_path, fitted_metadata, synth_out_dir):
+    """Documents are rendered from the Parquet partitions ordered by primary
+    key, so the files are byte-identical for any partition count (the module
+    fixture generated with 2 partitions; regenerate with 1)."""
+    single_dir = tmp_path / "single"
+    Engine(load_metadata(FITTED_PATH)).generate(str(single_dir), num_partitions=1)
+
+    for tname, path in _document_paths(synth_out_dir).items():
+        other = _document_paths(single_dir)[tname]
+        assert other.read_bytes() == path.read_bytes(), tname

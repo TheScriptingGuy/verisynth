@@ -21,7 +21,9 @@ cardinality ``lam``, and copula correlations are perturbed.
 from __future__ import annotations
 
 import copy
+import json
 import math
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -31,6 +33,7 @@ from scipy import stats
 
 from .metadata import CardinalitySpec, DistributionSpec, Metadata
 from .privacy import laplace_value, noisy_counts, split_epsilon
+from .xmlstream import flatten_xml_record
 
 try:  # pragma: no cover - exercised indirectly via _to_polars
     import pyarrow as pa
@@ -68,6 +71,15 @@ def fit_metadata(
         df = pl_frames.get(tname)
         if df is None:
             continue
+
+        # 0. In-table document columns (§11): fill in any embedded sibling
+        # columns declared in the skeleton but absent from the real frame by
+        # extracting them from the JSON/XML payload, before anything below
+        # fits marginals/cardinality/copulas/temporal delays against those
+        # columns. Store the expanded frame back so downstream child-table
+        # parent joins (cardinality, temporal anchors) see it too.
+        df = _expand_document_columns(t, df)
+        pl_frames[tname] = df
 
         # 1. Marginal columns, in declaration order.
         for cname, col in t.columns.items():
@@ -121,6 +133,93 @@ def _to_polars(df: Any) -> pl.DataFrame:
     if pa is not None and isinstance(df, pa.Table):
         return pl.from_arrow(df)
     raise TypeError(f"unsupported frame type: {type(df)!r}")
+
+
+# --------------------------------------------------------------------------
+# 0. In-table document columns (§11): skeleton-aware fit-side expansion,
+# the counterpart of scanner.py's scan-side ``_expand_document_columns``.
+# --------------------------------------------------------------------------
+
+
+_DOCUMENT_TYPE_CAST: dict[str, Any] = {
+    "int64": pl.Int64,
+    "float64": pl.Float64,
+    "bool": pl.Boolean,
+    "string": pl.String,
+}
+
+
+def _cast_document_sibling(name: str, values: list[Any], dsl_type: str) -> pl.Series:
+    """Cast raw values extracted from a payload column to a sibling's
+    declared DSL type. JSON payloads already yield native Python
+    int/float/bool objects for those types (``json.loads``); XML payloads
+    (and any JSON string-typed field) yield raw strings, which need the
+    string-specific parsing below (a plain ``.cast()`` is enough otherwise --
+    see TASK CARD note: don't re-parse values that already aren't strings)."""
+    s = pl.Series(name, values)
+    if dsl_type == "bool" and s.dtype == pl.String:
+        return s.replace_strict({"true": True, "false": False}, default=None, return_dtype=pl.Boolean)
+    if dsl_type == "timestamp":
+        if s.dtype == pl.String:
+            return s.str.to_datetime(time_unit="us")
+        return s.cast(pl.Datetime("us"))
+    return s.cast(_DOCUMENT_TYPE_CAST[dsl_type])
+
+
+def _parse_document_payload(value: str, kind: str, tname: str, cname: str) -> dict[str, Any]:
+    try:
+        if kind == "json":
+            obj = json.loads(value)
+            if not isinstance(obj, dict):
+                raise ValueError(f"expected a JSON object, got {type(obj).__name__}")
+            return obj
+        return flatten_xml_record(ET.fromstring(value))
+    except Exception as e:
+        raise ValueError(
+            f"fit_metadata: malformed {kind} document payload in '{tname}.{cname}': {e}"
+        ) from e
+
+
+def _expand_document_columns(t: Any, df: pl.DataFrame) -> pl.DataFrame:
+    """Fill in any skeleton-declared sibling columns embedded in a
+    ``document:`` payload column but missing from the real ``df`` (e.g. a
+    frame that only has the raw ``payload`` string column, not the
+    relational columns it serializes).
+
+    For each payload column with a ``document`` spec present in ``df`` as a
+    string column: the embedded sibling names are ``document.columns``, or
+    (when empty) every sibling column without its own ``document`` spec.
+    Siblings already present in ``df`` are left untouched (no
+    double-expansion) -- fitting still reads them straight from the frame.
+    Malformed payload values raise ``ValueError`` naming the table+column
+    (fitting is offline; silently nulling a corrupt row would corrupt the
+    fit). The payload column itself is never modified or fitted.
+    """
+    for cname, col in t.columns.items():
+        doc = col.document
+        if doc is None or cname not in df.columns or df[cname].dtype != pl.String:
+            continue
+
+        embedded_names = doc.columns or [
+            other for other, oc in t.columns.items() if other != cname and oc.document is None
+        ]
+        missing = [name for name in embedded_names if name not in df.columns]
+        if not missing:
+            continue
+
+        parsed: list[dict[str, Any] | None] = [
+            None if v is None else _parse_document_payload(v, doc.kind, t.name, cname)
+            for v in df[cname].to_list()
+        ]
+
+        new_series = []
+        for name in missing:
+            sibling_type = t.columns[name].type
+            values = [p.get(name) if p is not None else None for p in parsed]
+            new_series.append(_cast_document_sibling(name, values, sibling_type))
+        df = df.with_columns(new_series)
+
+    return df
 
 
 # --------------------------------------------------------------------------
