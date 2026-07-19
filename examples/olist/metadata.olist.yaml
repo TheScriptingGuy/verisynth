@@ -218,6 +218,16 @@ tables:
         type: string
         generator: parent:state
     source: shop
+    format:
+      kind: json
+      schemas:
+      - schemas/shop_customer.schema.json
+      nest:
+      - table: orders
+        as: orders
+        nest:
+        - table: order_items
+          as: items
     parent: crm_contacts
     cardinality:
       kind: bernoulli

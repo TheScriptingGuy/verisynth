@@ -39,6 +39,8 @@ Event flow: `crm_contacts.created_at` → `opened_at` → `resolved_at`
 
 Child of `crm_contacts`: each crm_contacts row has one customers row with probability 60%.
 
+Also rendered as a JSON document file shaped by `schemas/shop_customer.schema.json`, nesting `orders` as `orders` inside each record.
+
 - **customer_id** (int64): primary key
 - **contact_id** (int64): reference to the `crm_contacts` row
 - **customer_state** (string): inherited from `crm_contacts.state` (master data — always identical to the parent's value)

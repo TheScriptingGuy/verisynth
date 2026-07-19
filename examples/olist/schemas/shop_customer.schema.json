@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shop_customer.schema.json",
+  "title": "Shop customer-account export",
+  "description": "Two-level relational nesting bound by schema (docs/ARCHITECTURE.md §11): the 'orders' array property binds to the orders child table via format.nest, and each order's 'items' array binds to order_items — leaf property names match verisynth columns.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["customer_id", "orders"],
+    "properties": {
+      "customer_id": {"type": "integer"},
+      "contact_id": {"type": "integer"},
+      "customer_state": {"type": "string"},
+      "orders": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["order_id", "items"],
+          "properties": {
+            "order_id": {"type": "integer"},
+            "order_status": {"type": "string"},
+            "order_purchase_timestamp": {"type": "string", "format": "date-time"},
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["order_item_id"],
+                "properties": {
+                  "order_item_id": {"type": "integer"},
+                  "price": {"type": "number"},
+                  "freight_value": {"type": "number"},
+                  "product_id": {"type": "integer"}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -80,6 +80,19 @@ tables:
     cardinality: {kind: bernoulli, p: 0.6}
     child_stride: 2
     primary_key: customer_id
+    # Schema-bound, TWO-LEVEL relational nesting (docs/ARCHITECTURE.md §11):
+    # the customer-account export nests each customer's orders, and each
+    # order's line items, as arrays declared in the JSON Schema -- the
+    # schema's `orders` / `items` array properties bind to the nest entries
+    # below by name.
+    format:
+      kind: json
+      schemas: [schemas/shop_customer.schema.json]
+      nest:
+      - table: orders
+        as: orders
+        nest:
+        - {table: order_items, as: items}
     columns:
       customer_id: {type: int64, generator: key}
       contact_id: {type: int64, generator: parent_key}

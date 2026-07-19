@@ -729,6 +729,7 @@ def _document_paths(out_dir: Path) -> dict[str, Path]:
         "edi_shipments": out_dir / "edi" / "edi_shipments.xml",
         "orders": out_dir / "shop" / "orders.json",
         "crm_contacts": out_dir / "crm" / "crm_contacts.xml",
+        "customers": out_dir / "shop" / "customers.json",
     }
 
 
@@ -966,6 +967,45 @@ def test_crm_contacts_xml_nests_tickets(synth_out_dir, synth_frames):
             assert n.find("channel").text == e["channel"]
         total += len(nested)
     assert total == tickets.height
+
+
+def test_customers_json_schema_bound_two_level_nesting(synth_out_dir, synth_frames):
+    """Schema-bound, two-level relational nesting: customers.json nests
+    orders inside customers and order_items inside orders, shaped by
+    shop_customer.schema.json — every order and item row appears exactly
+    once, ordered by child pk, agreeing with the flat tables."""
+    import json as json_mod
+
+    with open(_document_paths(synth_out_dir)["customers"]) as f:
+        records = json_mod.load(f)
+    assert len(records) == synth_frames["customers"].height
+
+    orders_by_customer: dict = {}
+    for row in synth_frames["orders"].sort("order_id").iter_rows(named=True):
+        orders_by_customer.setdefault(row["customer_id"], []).append(row)
+    items_by_order: dict = {}
+    for row in synth_frames["order_items"].sort("order_item_id").iter_rows(named=True):
+        items_by_order.setdefault(row["order_id"], []).append(row)
+
+    total_orders = total_items = 0
+    for rec in records:
+        # Schema-shaped: only declared properties, schema property order.
+        assert set(rec) <= {"customer_id", "contact_id", "customer_state", "orders"}
+        expected_orders = orders_by_customer.get(rec["customer_id"], [])
+        assert [o["order_id"] for o in rec["orders"]] == [
+            e["order_id"] for e in expected_orders
+        ]
+        total_orders += len(rec["orders"])
+        for o, e in zip(rec["orders"], expected_orders):
+            assert set(o) <= {"order_id", "order_status", "order_purchase_timestamp", "items"}
+            assert o["order_status"] == e["order_status"]
+            expected_items = items_by_order.get(o["order_id"], [])
+            assert [i["order_item_id"] for i in o["items"]] == [
+                x["order_item_id"] for x in expected_items
+            ]
+            total_items += len(o["items"])
+    assert total_orders == synth_frames["orders"].height
+    assert total_items == synth_frames["order_items"].height
 
 
 def test_scan_reverses_nested_documents(synth_out_dir, tmp_path):

@@ -296,6 +296,13 @@ entities rendered as nested entities inside the documents:
 - `crm/crm_contacts.xml`: each `<contact>` nests its support tickets as
   `<tickets><ticket>…</ticket></tickets>` — the same ticket rows that also
   ship flat in `crm_tickets.jsonl`, agreeing by construction.
+- `shop/customers.json`: the **schema-bound, two-level** case — a
+  customer-account export shaped by `schemas/shop_customer.schema.json`,
+  whose `orders` and `items` array properties bind to the recursive
+  `format.nest` entries (customers → orders → order_items). The same
+  order/item rows appear here nested two levels deep AND in
+  `shop/orders.json` one level deep AND as flat Parquet — all three agree
+  row-for-row because every rendering reads the same canonical partitions.
 
 Scanning those generated documents reverses the nesting: the `items` /
 `payments` arrays and the repeated `<ticket>` elements come back as
