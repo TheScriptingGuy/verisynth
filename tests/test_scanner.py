@@ -319,6 +319,36 @@ def test_xml_loading(tmp_path):
     assert ships.columns["notes"].null_rate > 0
 
 
+def test_xml_subdirectory_as_table(tmp_path):
+    d = tmp_path / "shipments"
+    d.mkdir()
+    # Two files, sorted file order, streamed as one logical table.
+    (d / "part0.xml").write_text(_shipments_xml(5))
+    root = ET.Element("shipments")
+    for i in range(5, 10):
+        s = ET.SubElement(root, "shipment")
+        ET.SubElement(s, "shipment_id").text = str(i)
+        ET.SubElement(s, "warehouse").text = ["W1", "W2"][i % 2]
+        ET.SubElement(s, "routing")
+        ET.SubElement(s, "created_at").text = f"2022-02-{(i % 28) + 1:02d}T00:00:00"
+    (d / "part1.xml").write_text(ET.tostring(root, encoding="unicode"))
+
+    report = scan_directory(tmp_path)
+    ships = report.tables["shipments"]
+    assert ships.rows == 10
+    assert ships.pk == "shipment_id"
+    assert ships.columns["shipment_id"].type == "int64"
+    assert ships.columns["warehouse"].type == "string"
+
+
+def test_xml_scan_row_cap(tmp_path, monkeypatch):
+    (tmp_path / "shipments.xml").write_text(_shipments_xml(200))
+    monkeypatch.setenv("VERISYNTH_XML_SCAN_ROWS", "50")
+
+    report = scan_directory(tmp_path)
+    assert report.tables["shipments"].rows == 50
+
+
 def test_mixed_directory_loading(tmp_path):
     pl.DataFrame({"widget_id": np.arange(5, dtype=np.int64), "name": ["a", "b", "c", "d", "e"]}).write_parquet(
         tmp_path / "widgets.parquet"

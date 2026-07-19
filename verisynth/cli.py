@@ -1,10 +1,15 @@
-"""`verisynth generate / validate / fit`. See docs/ARCHITECTURE.md §8 (normative)."""
+"""`verisynth generate / validate / fit / scan / init / explain / ingest`.
+
+See docs/ARCHITECTURE.md §8 (normative)."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import duckdb
@@ -19,6 +24,7 @@ from .fit import fit_metadata
 from .metadata import load_metadata, metadata_to_dict
 from .scanner import init_from_dir, render_report, report_to_dict, scan_directory
 from .wizard import Chat, WizardAborted, run_wizard
+from .xmlstream import DEFAULT_BATCH_ROWS, xml_dir_to_parquet
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
@@ -87,6 +93,54 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         print(json.dumps(report_to_dict(report), indent=2, default=str))
     else:
         print(render_report(report))
+    return 0
+
+
+def _cmd_ingest(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"ingest: input not found: {input_path}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(args.out) / args.table
+    infer_types = not args.no_infer_types
+
+    try:
+        if input_path.is_file():
+            if input_path.suffix != ".xml":
+                print(f"ingest: file input must be .xml (got {input_path})", file=sys.stderr)
+                return 1
+            # xml_dir_to_parquet ingests a *directory* of files; for a single
+            # file, stage it alone in a throwaway dir so the same
+            # parallel/type-inference code path applies without touching
+            # any sibling files (we may not edit xmlstream.py).
+            with tempfile.TemporaryDirectory() as tmp:
+                link = Path(tmp) / input_path.name
+                try:
+                    os.symlink(input_path.resolve(), link)
+                except OSError:
+                    shutil.copy(input_path, link)
+                total = xml_dir_to_parquet(
+                    tmp,
+                    out_dir,
+                    workers=args.workers,
+                    batch_rows=args.batch_rows,
+                    infer_types=infer_types,
+                )
+        else:
+            total = xml_dir_to_parquet(
+                input_path,
+                out_dir,
+                workers=args.workers,
+                batch_rows=args.batch_rows,
+                infer_types=infer_types,
+            )
+    except FileNotFoundError as e:
+        print(f"ingest: {e}", file=sys.stderr)
+        return 1
+
+    n_parts = len(list(out_dir.glob("*.parquet")))
+    print(f"ingest: {total} records, {n_parts} parquet file(s) -> {out_dir}")
     return 0
 
 
@@ -159,7 +213,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="verisynth")
+    parser = argparse.ArgumentParser(
+        prog="verisynth",
+        epilog=(
+            "Data ingestion: `verisynth ingest` streams XML file(s) into a Parquet "
+            "staging dataset that `scan`/`fit` then read out-of-core."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_gen = sub.add_parser("generate", help="generate a synthetic dataset")
@@ -186,7 +246,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "scan", help="scan real data files and report detected keys, relations, cardinality"
     )
     p_scan.add_argument(
-        "--input", required=True, help="dir with {table}.parquet/.csv/.json/.jsonl/.xml files"
+        "--input",
+        required=True,
+        help=(
+            "dir with {table}.parquet/.csv/.json/.jsonl/.xml files, and/or "
+            "{table}/ subdirectories of *.xml files loaded as one table"
+        ),
     )
     p_scan.add_argument("--json", action="store_true", help="emit the report as JSON")
     p_scan.set_defaults(func=_cmd_scan)
@@ -220,6 +285,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o", "--out", default=None, help="write to this .md file instead of stdout"
     )
     p_explain.set_defaults(func=_cmd_explain)
+
+    p_ingest = sub.add_parser(
+        "ingest",
+        help="stream one XML file (or a directory of them) into a Parquet staging dataset",
+    )
+    p_ingest.add_argument(
+        "--input", required=True, help="a single .xml file, or a directory of .xml files"
+    )
+    p_ingest.add_argument("--out", required=True, help="staging directory root")
+    p_ingest.add_argument(
+        "--table", required=True, help="logical table name (written under out/NAME)"
+    )
+    p_ingest.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="parallel worker processes for directory input (default: cpu count)",
+    )
+    p_ingest.add_argument(
+        "--batch-rows",
+        type=int,
+        default=DEFAULT_BATCH_ROWS,
+        help=f"records per streamed batch/parquet part (default: {DEFAULT_BATCH_ROWS})",
+    )
+    p_ingest.add_argument(
+        "--no-infer-types",
+        action="store_true",
+        help="skip the DuckDB type-inference pass; keep all columns as text",
+    )
+    p_ingest.set_defaults(func=_cmd_ingest)
 
     return parser
 

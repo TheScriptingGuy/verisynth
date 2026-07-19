@@ -1,12 +1,14 @@
 """Metadata scanner: profile real tables and detect structure.
 
 Reads a directory of ``{table}.parquet`` / ``{table}.csv`` / ``{table}.json``
-(or ``.jsonl`` / ``.ndjson``) / ``{table}.xml`` files and infers the
-structural facts a metadata skeleton needs: column types and null rates,
-primary-key candidates, foreign-key relations (with value-containment
-evidence), parent/child cardinality profiles, and per-column distribution
-suggestions. The interactive wizard (``verisynth init``, see wizard.py) uses
-the report as chat suggestions; ``verisynth scan`` prints it directly.
+(or ``.jsonl`` / ``.ndjson``) / ``{table}.xml`` files -- plus ``{table}/``
+subdirectories containing one or more ``*.xml`` files, loaded as a single
+logical table -- and infers the structural facts a metadata skeleton needs:
+column types and null rates, primary-key candidates, foreign-key relations
+(with value-containment evidence), parent/child cardinality profiles, and
+per-column distribution suggestions. The interactive wizard (``verisynth
+init``, see wizard.py) uses the report as chat suggestions; ``verisynth
+scan`` prints it directly.
 
 Detection is heuristic and advisory: nothing here mutates data, and every
 finding carries the evidence (coverage, counts) so a human can veto it.
@@ -15,15 +17,23 @@ finding carries the evidence (coverage, counts) so a human can veto it.
 from __future__ import annotations
 
 import math
-import xml.etree.ElementTree as ET
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import duckdb
 import polars as pl
 
 from ._skeleton_infer import assign_source, infer_skeleton, init_from_dir  # noqa: F401
+from .xmlstream import flatten_xml_record, iter_xml_batches
+
+# Scan is advisory profiling, not a full ingestion pipeline (see `verisynth
+# ingest` / xmlstream.xml_dir_to_parquet for that): cap the number of XML
+# records materialized for a table at this many rows so a multi-GB file or
+# huge xml/ subdirectory can still be profiled in bounded time/memory,
+# overridable via VERISYNTH_XML_SCAN_ROWS for tests/tuning.
+_XML_SCAN_MAX_ROWS = 1_000_000
 
 # Containment threshold for accepting a foreign-key candidate: at least this
 # fraction of the child column's non-null values must exist in the parent key.
@@ -87,6 +97,15 @@ def _load_frames(input_dir: str | Path) -> dict[str, pl.DataFrame]:
         raise FileNotFoundError(f"scan: {p} is not a directory")
     frames: dict[str, pl.DataFrame] = {}
     for f in sorted(p.iterdir()):
+        if f.is_dir():
+            # A subdirectory of *.xml files is one logical table named after
+            # the subdirectory (100k-file ingestion uses the same shape --
+            # see xmlstream.xml_dir_to_parquet -- this is the scan-side
+            # analogue, capped for profiling).
+            xml_files = sorted(x for x in f.glob("*.xml") if x.is_file())
+            if xml_files:
+                frames[f.name] = _load_xml_dir(xml_files)
+            continue
         if f.suffix == ".parquet":
             frames[f.stem] = pl.read_parquet(f)
         elif f.suffix == ".csv":
@@ -97,7 +116,8 @@ def _load_frames(input_dir: str | Path) -> dict[str, pl.DataFrame]:
             frames[f.stem] = _load_xml(f)
     if not frames:
         raise FileNotFoundError(
-            f"scan: no .parquet, .csv, .json/.jsonl/.ndjson or .xml data files found in {p}"
+            f"scan: no .parquet, .csv, .json/.jsonl/.ndjson or .xml data files "
+            f"(or {{table}}/ xml subdirectories) found in {p}"
         )
     return frames
 
@@ -155,28 +175,10 @@ def _flatten_structs(df: pl.DataFrame) -> pl.DataFrame:
 # XML loading
 # --------------------------------------------------------------------------
 
-
-def _flatten_xml_record(elem: ET.Element) -> dict[str, str | None]:
-    """Flatten one XML record element into a leaf-named dict of raw strings.
-
-    An element with children recurses (it behaves like a JSON struct); an
-    element without children contributes its (possibly null) text. On a
-    name collision with an already-populated key, the value is renamed to
-    ``{container_tag}_{leaf}`` where ``container_tag`` is the tag of the
-    element that directly owns the colliding field.
-    """
-    out: dict[str, str | None] = {}
-    for child in elem:
-        if list(child):
-            sub = _flatten_xml_record(child)
-            for k, v in sub.items():
-                key = k if k not in out else f"{child.tag}_{k}"
-                out[key] = v
-        else:
-            text = (child.text or "").strip()
-            key = child.tag if child.tag not in out else f"{elem.tag}_{child.tag}"
-            out[key] = text if text else None
-    return out
+# Canonical flattening implementation now lives in xmlstream.py (streaming
+# reader + Rust/reference backend parity); kept here as a backward-compat
+# alias for any external callers of the old private name.
+_flatten_xml_record = flatten_xml_record
 
 
 def _infer_xml_column(s: pl.Series) -> pl.Series:
@@ -202,14 +204,56 @@ def _infer_xml_column(s: pl.Series) -> pl.Series:
     return s
 
 
-def _load_xml(path: Path) -> pl.DataFrame:
-    """Load an XML file: records are the child elements of the document root."""
-    root = ET.parse(path).getroot()
-    records = [_flatten_xml_record(rec) for rec in root]
-    # infer_schema_length=None: a leaf element may first appear past the
-    # default 100-record inference window (optional elements are omitted).
-    df = pl.DataFrame(records, infer_schema_length=None)
+def _xml_scan_max_rows() -> int:
+    raw = os.environ.get("VERISYNTH_XML_SCAN_ROWS")
+    return int(raw) if raw else _XML_SCAN_MAX_ROWS
+
+
+def _load_xml_frame(batches: Iterator[pl.DataFrame]) -> pl.DataFrame:
+    """Accumulate streamed XML batches up to the scan sample cap
+    (``_XML_SCAN_MAX_ROWS`` / ``VERISYNTH_XML_SCAN_ROWS``), then type each
+    column with ``_infer_xml_column``.
+
+    Scan is advisory profiling, not full ingestion: capping huge files/xml
+    tables here (rather than materializing every record) is documented,
+    deliberate behavior -- see the module docstring and `verisynth ingest`
+    for unbounded ingestion.
+    """
+    cap = _xml_scan_max_rows()
+    dfs: list[pl.DataFrame] = []
+    total = 0
+    for batch in batches:
+        dfs.append(batch)
+        total += batch.height
+        if total >= cap:
+            break
+    if not dfs:
+        return pl.DataFrame()
+    # how="diagonal": schemas may be ragged across batches (an optional leaf
+    # first appears in a later batch); missing columns are filled with null.
+    df = pl.concat(dfs, how="diagonal")
+    if df.height > cap:
+        df = df.head(cap)
     return df.with_columns(_infer_xml_column(df[c]) for c in df.columns)
+
+
+def _load_xml(path: Path) -> pl.DataFrame:
+    """Load a single XML file: records are the child elements of the
+    document root, streamed via ``xmlstream.iter_xml_batches`` (bounded
+    memory) and capped at the scan sample size."""
+    return _load_xml_frame(iter_xml_batches(path))
+
+
+def _load_xml_dir(files: list[Path]) -> pl.DataFrame:
+    """Load a ``{table}/`` subdirectory of XML files as one logical table:
+    chain each file's records (sorted file order) through the same
+    batch/cap logic used for a single file."""
+
+    def _chained() -> Iterator[pl.DataFrame]:
+        for f in files:
+            yield from iter_xml_batches(f)
+
+    return _load_xml_frame(_chained())
 
 
 def _dsl_type(dtype: pl.DataType) -> str:
