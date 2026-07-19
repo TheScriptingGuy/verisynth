@@ -114,8 +114,27 @@ class _ZipfMarginal:
 
     def ppf(self, u: np.ndarray) -> np.ndarray:
         u = np.asarray(u, dtype=np.float64)
-        out = stats.zipfian.ppf(u, self.a, self.n).astype(np.int64) - 1
-        return np.clip(out, 0, self.n - 1)
+        # Bit-identical to `stats.zipfian.ppf(u, a, n) - 1`, but O(n) once +
+        # O(len(u)·log n) instead of scipy's generic O(n·len(u)) per-element
+        # inversion (which recomputes the generalized harmonic sum in a Python
+        # loop for every element and effectively hangs on large `n` under the
+        # scipy < 1.16 that Python 3.10 resolves to). zipfian's CDF over ranks
+        # 1..n is the normalized cumulative generalized-harmonic weight, so the
+        # 0-based inverse-CDF is just a searchsorted into that cached array.
+        cdf = self._cdf()
+        out = np.searchsorted(cdf, u, side="left")
+        return np.clip(out, 0, self.n - 1).astype(np.int64)
+
+    def _cdf(self) -> np.ndarray:
+        cached = getattr(self, "_cdf_cache", None)
+        if cached is None:
+            ranks = np.arange(1, self.n + 1, dtype=np.float64)
+            weights = ranks ** (-self.a)
+            cdf = np.cumsum(weights)
+            cdf /= cdf[-1]
+            self._cdf_cache = cdf
+            cached = cdf
+        return cached
 
 
 @dataclass
